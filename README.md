@@ -9,7 +9,7 @@ A UEFN project carries identifiers that tie it to its creator's Epic account: th
 Paste this into any PowerShell window:
 
 ```powershell
-irm https://raw.githubusercontent.com/<your-github-user>/UEFNShare/main/UEFNShare.ps1 | iex
+irm https://raw.githubusercontent.com/magnusenebakk-epic/UEFNShare/main/UEFNShare.ps1 | iex
 ```
 
 Or download this repo as a zip, extract it, and double-click **`UEFNShare.cmd`** (no admin rights needed; if Windows shows an "Open File – Security Warning" once, click Run).

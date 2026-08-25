@@ -5,7 +5,7 @@
 #region Constants
 
 $script:ToolVersion       = '1.0.0'
-$script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/<your-github-user>/UEFNShare/main/index.json'
+$script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNShare/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNShare\settings.json'
 $script:UefnIniPath       = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini'
 $script:VkProjectsIniDir  = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Config\WindowsEditor\VK_Projects'
@@ -1035,7 +1035,7 @@ function Invoke-ExportFlow {
         uefnCompatibilityVersion = $post.CompatibilityVersion
         sizeMB                   = $sizeMB
         sha256                   = $sha
-        downloadUrl              = "https://github.com/<your-github-user>/UEFNShare/releases/download/<tag>/$($zipItem.Name)"
+        downloadUrl              = "https://github.com/magnusenebakk-epic/UEFNShare/releases/download/<tag>/$($zipItem.Name)"
     }
     $entryJson = [pscustomobject]$entry | ConvertTo-Json -Depth 5
 
