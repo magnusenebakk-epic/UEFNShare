@@ -78,8 +78,20 @@ function Read-YesNo {
     }
 }
 
+function Test-InteractiveConsole {
+    # Arrow-key menus need a real console host with unredirected keyboard AND screen
+    # (in-place redrawing uses SetCursorPosition, which throws on redirected output).
+    try {
+        return ($Host.Name -eq 'ConsoleHost') -and
+               -not [Console]::IsInputRedirected -and
+               -not [Console]::IsOutputRedirected
+    } catch { return $false }
+}
+
 function Read-MenuChoice {
-    # Numbered menu. Returns 0-based index, or -1 when Back/Quit is chosen.
+    # Menu picker: arrow keys + Enter in a real console (number keys jump directly); falls
+    # back to typed numbers when input is redirected. Returns the 0-based option index, or
+    # -1 when Back/Quit is chosen.
     param(
         [string]$Title = '',
         [Parameter(Mandatory)][string[]]$Options,
@@ -87,24 +99,105 @@ function Read-MenuChoice {
         [string]$DefaultChoice = ''
     )
     if ($Title -ne '') { Write-Head $Title }
-    for ($i = 0; $i -lt $Options.Count; $i++) {
-        Write-Host ("  [{0}] {1}" -f ($i + 1), $Options[$i])
-    }
-    Write-Host ("  [B] {0}" -f $BackLabel)
-    while ($true) {
-        if ($DefaultChoice -ne '') {
-            Write-Host "Choice [$DefaultChoice]: " -ForegroundColor White -NoNewline
-        } else {
-            Write-Host 'Choice: ' -ForegroundColor White -NoNewline
+
+    if (-not (Test-InteractiveConsole)) {
+        for ($i = 0; $i -lt $Options.Count; $i++) {
+            Write-Host ("  [{0}] {1}" -f ($i + 1), $Options[$i])
         }
-        $resp = Read-Host
-        if (($null -eq $resp -or $resp.Trim() -eq '') -and $DefaultChoice -ne '') { $resp = $DefaultChoice }
-        $resp = $resp.Trim()
-        if ($resp -match '^(b|q)$') { return -1 }
-        $n = 0
-        if ([int]::TryParse($resp, [ref]$n) -and $n -ge 1 -and $n -le $Options.Count) { return ($n - 1) }
-        Write-Warn ("Enter a number between 1 and {0}, or B to go back." -f $Options.Count)
+        Write-Host ("  [B] {0}" -f $BackLabel)
+        while ($true) {
+            if ($DefaultChoice -ne '') {
+                Write-Host "Choice [$DefaultChoice]: " -ForegroundColor White -NoNewline
+            } else {
+                Write-Host 'Choice: ' -ForegroundColor White -NoNewline
+            }
+            $resp = Read-Host
+            if (($null -eq $resp -or $resp.Trim() -eq '') -and $DefaultChoice -ne '') { $resp = $DefaultChoice }
+            $resp = $resp.Trim()
+            if ($resp -match '^(b|q)$') { return -1 }
+            $n = 0
+            if ([int]::TryParse($resp, [ref]$n) -and $n -ge 1 -and $n -le $Options.Count) { return ($n - 1) }
+            Write-Warn ("Enter a number between 1 and {0}, or B to go back." -f $Options.Count)
+        }
     }
+
+    # Interactive mode: Back/Quit is the last selectable item.
+    $items = @($Options) + @($BackLabel)
+    $backIndex = $items.Count - 1
+    $sel = 0
+    $n0 = 0
+    if ($DefaultChoice -ne '' -and [int]::TryParse($DefaultChoice, [ref]$n0) -and $n0 -ge 1 -and $n0 -le $Options.Count) {
+        $sel = $n0 - 1
+    }
+
+    # Lines longer than the console width would wrap and break in-place redrawing.
+    $width = [Math]::Max(20, [Console]::WindowWidth - 1)
+    $view = [Math]::Min($items.Count, [Math]::Max(4, [Console]::WindowHeight - 6))
+    $offset = [Math]::Max(0, [Math]::Min($sel, $items.Count - $view))
+    $totalLines = $view + 1
+
+    # Reserve the lines first so the top row is stable even if the buffer scrolls.
+    for ($i = 0; $i -lt $totalLines; $i++) { Write-Host '' }
+    $top = [Console]::CursorTop - $totalLines
+
+    $cursorWasVisible = $true
+    try { $cursorWasVisible = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch { }
+    try {
+        while ($true) {
+            if ($sel -lt $offset) { $offset = $sel }
+            if ($sel -ge ($offset + $view)) { $offset = $sel - $view + 1 }
+
+            [Console]::SetCursorPosition(0, $top)
+            for ($row = 0; $row -lt $view; $row++) {
+                $i = $offset + $row
+                $num = if ($i -eq $backIndex) { ' B' } else { '{0,2}' -f ($i + 1) }
+                $line = "$num. $($items[$i])"
+                if ($line.Length -gt ($width - 5)) { $line = $line.Substring(0, $width - 8) + '...' }
+                if ($i -eq $sel) {
+                    Write-Host ('> ' + $line).PadRight($width) -ForegroundColor Cyan
+                } else {
+                    Write-Host ('  ' + $line).PadRight($width)
+                }
+            }
+            $scrollNote = if ($items.Count -gt $view) { " ($($sel + 1)/$($items.Count))" } else { '' }
+            $hint = "  Up/Down move, Enter select, Esc = $BackLabel$scrollNote"
+            if ($hint.Length -gt $width) { $hint = $hint.Substring(0, $width) }
+            # No trailing newline on the last reserved row, or the buffer scrolls each redraw.
+            Write-Host $hint.PadRight($width) -ForegroundColor DarkGray -NoNewline
+
+            $key = [Console]::ReadKey($true)
+            $confirmed = $false
+            switch ($key.Key) {
+                'UpArrow'   { $sel = ($sel - 1 + $items.Count) % $items.Count }
+                'DownArrow' { $sel = ($sel + 1) % $items.Count }
+                'Home'      { $sel = 0 }
+                'End'       { $sel = $items.Count - 1 }
+                'Enter'     { $confirmed = $true }
+                'Escape'    { $sel = $backIndex; $confirmed = $true }
+                'B'         { $sel = $backIndex; $confirmed = $true }
+                'Q'         { $sel = $backIndex; $confirmed = $true }
+                default {
+                    $ch = $key.KeyChar
+                    if ($ch -ge '1' -and $ch -le '9') {
+                        $n = [int]$ch - [int][char]'0'
+                        if ($n -le $Options.Count) { $sel = $n - 1; $confirmed = $true }
+                    }
+                }
+            }
+            if ($confirmed) { break }
+        }
+
+        # Blank the hint line and leave a one-line record of the choice.
+        [Console]::SetCursorPosition(0, $top + $view)
+        Write-Host (' ' * $width) -NoNewline
+        [Console]::SetCursorPosition(0, $top + $view)
+        Write-Host ("Selected: {0}" -f $items[$sel]) -ForegroundColor White
+    } finally {
+        try { [Console]::CursorVisible = $cursorWasVisible } catch { }
+    }
+
+    if ($sel -eq $backIndex) { return -1 }
+    return $sel
 }
 
 #endregion
