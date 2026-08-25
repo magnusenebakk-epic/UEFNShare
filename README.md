@@ -21,8 +21,9 @@ Or download this repo as a zip, extract it, and double-click **`UEFNShare.cmd`**
   [2] Install from local zip or folder - install a project someone sent you (source is never modified)
   [3] Duplicate one of my projects     - copy a local project as a fresh, independent project
   [4] Export one of my projects        - build a shareable zip with your identity stripped
-  [5] Settings                         - catalog URL, projects folder override
-  [6] Help
+  [5] Remove an installed project      - delete a project plus UEFN's editor-generated state for it
+  [6] Settings                         - catalog URL, projects folder override
+  [7] Help
 ```
 
 Everything is prompted step by step, and every prompt that can be auto-detected (your UEFN projects folder, project titles, versions) offers that value as the default — just press Enter to accept.

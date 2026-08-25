@@ -4,7 +4,7 @@
 
 #region Constants
 
-$script:ToolVersion       = '1.1.0'
+$script:ToolVersion       = '1.2.0'
 $script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNShare/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNShare\settings.json'
 $script:UefnIniPath       = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini'
@@ -1202,6 +1202,90 @@ function Invoke-ExportFlow {
     Write-Info 'entry above,  3) paste the entry into index.json and push it.'
 }
 
+function Get-ProjectSidecarPaths {
+    # Editor-generated per-project state OUTSIDE the project folder. UEFN recreates all of
+    # this lazily on open; removing it with the project prevents stale-state buildup.
+    param([Parameter(Mandatory)]$Info)
+    $ua = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite'
+    $paths = @(
+        (Join-Path $ua "Saved\Config\WindowsEditor\VK_Projects\$($Info.ProjectId).ini"),
+        (Join-Path $ua "Saved\VK_Projects\$($Info.ProjectId)"),
+        (Join-Path $ua "Saved\VerseProject\$($Info.Name)"),
+        (Join-Path $ua "Saved\VerseProject\$($Info.Name).code-workspace"),
+        (Join-Path $ua "Saved\VerseSnapshot\$($Info.Name)"),
+        (Join-Path $ua "Saved\SourceControl\UncontrolledChangelists_$($Info.Name).json")
+    )
+    # Autosaves are keyed by NAME or PLUGIN name, and installed/duplicated copies share the
+    # original's plugin name - never touch an autosave key another local project also uses.
+    $otherKeys = @()
+    foreach ($p in @(Get-LocalProjects)) {
+        if ($p.Info.FolderPath -ne $Info.FolderPath) {
+            $otherKeys += @($p.Info.Name, $p.Info.PluginName)
+        }
+    }
+    foreach ($key in @($Info.Name, $Info.PluginName)) {
+        if ($otherKeys -notcontains $key) {
+            $paths += Join-Path $ua "Saved\Autosaves\$key"
+        }
+    }
+    foreach ($guid in $Info.Modules.Values) {
+        $paths += Join-Path $ua "Intermediate\ValkyrieUploadTemp\$guid"
+    }
+    return @($paths | Select-Object -Unique | Where-Object { Test-Path -LiteralPath $_ })
+}
+
+function Invoke-RemoveFlow {
+    $sel = Select-LocalProject -Title 'Remove an installed project'
+    if ($null -eq $sel) { return }
+    $info = $sel.Info
+
+    Write-Head "Remove '$($info.Name)'"
+    $sizeMB = Get-FolderSizeMB -Path $info.FolderPath
+    Write-Info ("Project folder: {0}  ({1} MB)" -f $info.FolderPath, $sizeMB)
+    if ((Test-Path -LiteralPath (Join-Path $info.FolderPath '.lore')) -or
+        (Test-Path -LiteralPath (Join-Path $info.FolderPath '.git'))) {
+        Write-Warn 'This project contains revision-control history (.lore/.git) - removing it deletes that local history too.'
+    }
+    $sidecars = @(Get-ProjectSidecarPaths -Info $info)
+    if ($sidecars.Count -gt 0) {
+        Write-Info 'Editor-generated state that will also be cleaned up:'
+        foreach ($s in $sidecars) { Write-Info "  $s" }
+    } else {
+        Write-Info 'No editor-generated sidecar state found for this project.'
+    }
+    if (Test-UefnRunning) {
+        Write-Warn 'UEFN is running. Close it first: open files block deletion, and UEFN may recreate some state on shutdown.'
+        if (-not (Read-YesNo 'Continue anyway?' -Default $false)) { return }
+    }
+
+    Write-Warn 'This permanently deletes the project from this machine. There is no undo.'
+    $typed = Read-Prompt "Type the project name ($($info.Name)) to confirm"
+    if ($typed -ne $info.Name) {
+        Write-Err 'Name did not match - nothing was deleted.'
+        return
+    }
+    if (-not (Read-YesNo 'Delete the project and the sidecar state listed above?' -Default $false)) { return }
+
+    try {
+        Clear-ReadOnlyFlags -Path $info.FolderPath
+        Remove-Item -LiteralPath $info.FolderPath -Recurse -Force -ErrorAction Stop
+        Write-Ok "Deleted $($info.FolderPath)"
+    } catch {
+        Write-Err "Could not delete the project folder: $($_.Exception.Message)"
+        Write-Info 'If UEFN (or VS Code) has the project open, close it and try again. Sidecar state was left untouched.'
+        return
+    }
+    foreach ($s in $sidecars) {
+        try {
+            Remove-Item -LiteralPath $s -Recurse -Force -ErrorAction Stop
+            Write-Ok "Removed $s"
+        } catch {
+            Write-Warn "Could not remove $s ($($_.Exception.Message))"
+        }
+    }
+    Write-Info 'UEFN forgets the project on its next Project Browser refresh; no other registration exists.'
+}
+
 function Invoke-SettingsFlow {
     while ($true) {
         $settings = Get-UefnShareSettings
@@ -1256,6 +1340,10 @@ project to YOUR account and it behaves as if you created it.
                      project (new GUIDs, unbound - UEFN re-binds it on open).
   Export             Packages one of your projects into a shareable zip with all
                      of your identity stripped, and emits a catalog entry.
+  Remove             Deletes an installed project AND the editor-generated state
+                     UEFN keeps for it outside the project folder (per-project
+                     config, Verse workspace/snapshot, autosaves). Asks you to
+                     type the project name before deleting - there is no undo.
 
 What install/export changes: fresh project + module GUIDs, Verse path reset to
 the unbound state, account-qualified 'using' paths in .verse files rewritten,
@@ -1292,6 +1380,7 @@ function Main {
             'Install from local zip or folder',
             'Duplicate one of my projects',
             'Export one of my projects for sharing',
+            'Remove an installed project',
             'Settings',
             'Help'
         ) -BackLabel 'Quit' -DefaultChoice '1'
@@ -1302,8 +1391,9 @@ function Main {
                 1  { Invoke-LocalInstallFlow }
                 2  { Invoke-DuplicateFlow }
                 3  { Invoke-ExportFlow }
-                4  { Invoke-SettingsFlow }
-                5  { Show-Help }
+                4  { Invoke-RemoveFlow }
+                5  { Invoke-SettingsFlow }
+                6  { Show-Help }
             }
         } catch {
             Write-Err $_.Exception.Message
