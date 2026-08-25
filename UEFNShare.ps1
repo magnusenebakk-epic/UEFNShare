@@ -4,7 +4,7 @@
 
 #region Constants
 
-$script:ToolVersion       = '1.0.0'
+$script:ToolVersion       = '1.1.0'
 $script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNShare/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNShare\settings.json'
 $script:UefnIniPath       = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini'
@@ -43,7 +43,9 @@ function Read-Prompt {
     )
     while ($true) {
         if ($Default -ne '') {
-            Write-Host "$Message [$Default]: " -ForegroundColor White -NoNewline
+            Write-Host $Message -ForegroundColor White -NoNewline
+            Write-Host " [Enter = $Default]" -ForegroundColor DarkGray -NoNewline
+            Write-Host ': ' -ForegroundColor White -NoNewline
         } else {
             Write-Host "${Message}: " -ForegroundColor White -NoNewline
         }
@@ -65,9 +67,11 @@ function Read-YesNo {
         [Parameter(Mandatory)][string]$Message,
         [bool]$Default = $true
     )
-    $hint = if ($Default) { '[Y/n]' } else { '[y/N]' }
+    $hint = if ($Default) { '[y/n, Enter = yes]' } else { '[y/n, Enter = no]' }
     while ($true) {
-        Write-Host "$Message $hint " -ForegroundColor White -NoNewline
+        Write-Host $Message -ForegroundColor White -NoNewline
+        Write-Host " $hint" -ForegroundColor DarkGray -NoNewline
+        Write-Host ': ' -ForegroundColor White -NoNewline
         $resp = Read-Host
         if ($null -eq $resp -or $resp.Trim() -eq '') { return $Default }
         switch -Regex ($resp.Trim()) {
@@ -107,7 +111,7 @@ function Read-MenuChoice {
         Write-Host ("  [B] {0}" -f $BackLabel)
         while ($true) {
             if ($DefaultChoice -ne '') {
-                Write-Host "Choice [$DefaultChoice]: " -ForegroundColor White -NoNewline
+                Write-Host "Choice [Enter = $DefaultChoice]: " -ForegroundColor White -NoNewline
             } else {
                 Write-Host 'Choice: ' -ForegroundColor White -NoNewline
             }
@@ -546,10 +550,10 @@ function Update-UefnProjectFile {
 function Update-UpluginFile {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$PluginName
+        [Parameter(Mandatory)][string]$NewVersePath
     )
     $text = Read-TextFileRaw $Path
-    $text = Set-JsonScalar -Text $text -Key 'VersePath' -NewValue "$script:VerseSentinelRoot/$PluginName"
+    $text = Set-JsonScalar -Text $text -Key 'VersePath' -NewValue $NewVersePath
     Write-TextFileNoBom -Path $Path -Text $text
 }
 
@@ -557,7 +561,8 @@ function Test-SanitizedProject {
     # Post-write validation; sanitize always runs on a staging copy, so a throw here aborts cleanly.
     param(
         [Parameter(Mandatory)][string]$FolderPath,
-        [Parameter(Mandatory)]$Pre
+        [Parameter(Mandatory)]$Pre,
+        [Parameter(Mandatory)][string]$ExpectedVersePath
     )
     $post = Get-ProjectInfo -FolderPath $FolderPath
     if ($post.ProjectVersePath -ne '') { throw 'Sanitize validation failed: projectVersePath was not cleared.' }
@@ -568,8 +573,8 @@ function Test-SanitizedProject {
         }
     }
     $plugJson = Get-Content -LiteralPath $post.UpluginFile -Raw | ConvertFrom-Json
-    if ("$($plugJson.VersePath)" -ne "$script:VerseSentinelRoot/$($post.PluginName)") {
-        throw 'Sanitize validation failed: uplugin VersePath is not the unbound sentinel.'
+    if ("$($plugJson.VersePath)" -ne $ExpectedVersePath) {
+        throw "Sanitize validation failed: uplugin VersePath is '$($plugJson.VersePath)', expected '$ExpectedVersePath'."
     }
     if ($post.PluginName -ne $Pre.PluginName) { throw 'Sanitize validation failed: plugin name changed.' }
     return $post
@@ -580,25 +585,30 @@ function Test-SanitizedProject {
 #region Verse source rewrite
 
 function Update-VerseSources {
-    # Rewrites the project's own account-qualified Verse path in .verse text sources to the
-    # unbound sentinel. Binary assets are never touched; UEFN's redirector fixes those on open.
+    # Rewrites the project's own Verse path prefix in .verse text sources. While unbound,
+    # UEFN mounts a project's Verse modules at /invaliddomain/<ProjectName> - the PROJECT
+    # name (folder/.uefnproject basename), NOT the plugin name - so every rewritten using
+    # must target exactly that, and a rename must re-run this. Binary assets are never
+    # touched; UEFN's redirector fixes those on open.
     param(
         [Parameter(Mandatory)][string]$ContentDir,
-        [AllowEmptyString()][string]$OldVersePath,
-        [Parameter(Mandatory)][string]$PluginName
+        [string[]]$OldVersePaths = @(),
+        [string[]]$OldProjectNames = @(),
+        [Parameter(Mandatory)][string]$NewVersePath
     )
     if (-not (Test-Path -LiteralPath $ContentDir)) { return 0 }
-    $sentinel = "$script:VerseSentinelRoot/$PluginName"
     $changed = 0
     foreach ($file in (Get-ChildItem -LiteralPath $ContentDir -Recurse -Filter '*.verse' -File -ErrorAction SilentlyContinue)) {
         $text = Read-TextFileRaw $file.FullName
         $new = $text
-        if ($OldVersePath -ne '' -and $OldVersePath -ne $sentinel) {
-            $new = $new.Replace($OldVersePath, $sentinel)
+        foreach ($old in $OldVersePaths) {
+            if ($old -ne '' -and $old -ne $NewVersePath) { $new = $new.Replace($old, $NewVersePath) }
         }
         # Residue catch: any account-qualified reference to THIS project (never other creators' libraries).
-        $residue = '/[\w.+-]+@fortnite\.com/' + [regex]::Escape($PluginName)
-        $new = [regex]::Replace($new, $residue, $sentinel)
+        foreach ($oldName in $OldProjectNames) {
+            $residue = '/[\w.+-]+@fortnite\.com/' + [regex]::Escape($oldName)
+            $new = [regex]::Replace($new, $residue, $NewVersePath)
+        }
         if ($new -ne $text) {
             Write-TextFileNoBom -Path $file.FullName -Text $new
             $changed++
@@ -634,9 +644,12 @@ function Invoke-ProjectSanitize {
         [Parameter(Mandatory)][string]$StagingPath,
         [Parameter(Mandatory)][string]$NewTitle,
         [Parameter(Mandatory)][ValidateSet('Install', 'Export', 'Duplicate')][string]$Mode,
-        $NewDescription = $null  # untyped on purpose; see Update-UefnProjectFile
+        $NewDescription = $null,  # untyped on purpose; see Update-UefnProjectFile
+        [string]$NewProjectName = ''  # final .uefnproject/folder name; drives the Verse path
     )
     $pre = Get-ProjectInfo -FolderPath $StagingPath
+    if ($NewProjectName -eq '') { $NewProjectName = $pre.Name }
+    $sentinel = "$script:VerseSentinelRoot/$NewProjectName"
 
     Clear-ReadOnlyFlags -Path $StagingPath
 
@@ -681,12 +694,16 @@ function Invoke-ProjectSanitize {
 
     Update-UefnProjectFile -Path $pre.UefnProjectFile -NewTitle $NewTitle `
         -ModuleNames @($pre.Modules.Keys) -NewDescription $NewDescription
-    Update-UpluginFile -Path $pre.UpluginFile -PluginName $pre.PluginName
+    Update-UpluginFile -Path $pre.UpluginFile -NewVersePath $sentinel
+    # Old prefixes: the bound account path (if any) plus the staged name's sentinel, which
+    # covers reinstalling an already-exported package under a different name.
+    $oldPaths = @("$script:VerseSentinelRoot/$($pre.Name)")
+    if ($pre.ProjectVersePath -ne '') { $oldPaths = @($pre.ProjectVersePath) + $oldPaths }
     $verseChanged = Update-VerseSources -ContentDir (Join-Path $StagingPath 'Content') `
-        -OldVersePath $pre.ProjectVersePath -PluginName $pre.PluginName
-    if ($verseChanged -gt 0) { Write-Info "Rewrote Verse paths in $verseChanged .verse file(s)" }
+        -OldVersePaths $oldPaths -OldProjectNames @($pre.Name) -NewVersePath $sentinel
+    if ($verseChanged -gt 0) { Write-Info "Rewrote Verse paths in $verseChanged .verse file(s) to $sentinel" }
 
-    return Test-SanitizedProject -FolderPath $StagingPath -Pre $pre
+    return Test-SanitizedProject -FolderPath $StagingPath -Pre $pre -ExpectedVersePath $sentinel
 }
 
 #endregion
@@ -876,10 +893,11 @@ function Get-UniqueFolderName {
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$BaseName
     )
+    # Suffix style Name2/Name3: the name becomes a Verse path component, so no spaces/parens.
     if (-not (Test-Path -LiteralPath (Join-Path $Root $BaseName))) { return $BaseName }
     $i = 2
-    while (Test-Path -LiteralPath (Join-Path $Root ("{0} ({1})" -f $BaseName, $i))) { $i++ }
-    return ("{0} ({1})" -f $BaseName, $i)
+    while (Test-Path -LiteralPath (Join-Path $Root ("{0}{1}" -f $BaseName, $i))) { $i++ }
+    return ("{0}{1}" -f $BaseName, $i)
 }
 
 function Install-ProjectFromStaging {
@@ -937,8 +955,8 @@ function Install-ProjectFromStaging {
         if ($folderName -eq '') {
             $folderName = Read-Prompt 'Install as folder name' -Default (Get-UniqueFolderName -Root $root -BaseName $info.Name)
         }
-        if ($folderName -match '[\\/:*?"<>|]') {
-            Write-Warn 'Folder name contains invalid characters.'
+        if ($folderName -notmatch '^[A-Za-z][A-Za-z0-9_]*$') {
+            Write-Warn 'Project names must start with a letter and use only letters, digits and underscores (the name becomes part of the Verse module path).'
             $folderName = ''
             continue
         }
@@ -951,8 +969,9 @@ function Install-ProjectFromStaging {
     }
 
     # Sanitize on the staging copy, then rename the .uefnproject to match the folder.
+    # The folder name is passed in because the unbound Verse path is /invaliddomain/<Name>.
     Write-Info 'Resetting project identity (new GUIDs, unbound Verse path)...'
-    $info = Invoke-ProjectSanitize -StagingPath $StagedRoot -NewTitle $title -Mode $Mode
+    $info = Invoke-ProjectSanitize -StagingPath $StagedRoot -NewTitle $title -Mode $Mode -NewProjectName $folderName
     if ($folderName -ne $info.Name) {
         Rename-Item -LiteralPath $info.UefnProjectFile -NewName "$folderName.uefnproject"
     }
@@ -1096,7 +1115,7 @@ function Invoke-DuplicateFlow {
         if (-not (Read-YesNo 'Continue?' -Default $false)) { return }
     }
 
-    $newFolder = Read-Prompt 'New folder name' -Default (Get-UniqueFolderName -Root $sel.Root -BaseName ($info.Name + '2'))
+    $newFolder = Read-Prompt 'New folder name' -Default (Get-UniqueFolderName -Root $sel.Root -BaseName $info.Name)
     $newTitle  = Read-Prompt 'New project title' -Default ($info.Title + ' Copy')
 
     # .lore is ALWAYS excluded: a copied revision-control DB shares the projectId/identity,
@@ -1262,6 +1281,7 @@ function Show-Banner {
     Write-Host ("UEFNShare v{0}" -f $script:ToolVersion) -ForegroundColor Cyan -NoNewline
     Write-Host ("    {0}" -f $uefnLabel) -ForegroundColor Gray
     Write-Host ("Projects folder: {0}" -f (Get-ProjectsRoot)) -ForegroundColor Gray
+    Write-Host 'Prompts show a suggested value in [brackets] - press Enter to accept it, or type your own.' -ForegroundColor DarkGray
 }
 
 function Main {

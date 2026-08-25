@@ -30,8 +30,8 @@ Everything is prompted step by step, and every prompt that can be auto-detected 
 ### What install/export changes inside a project
 
 - Fresh `projectId` and module GUIDs (`.uefnproject`)
-- Verse path reset to UEFN's unbound state (`projectVersePath = ""`, uplugin `VersePath = /invaliddomain/<Plugin>`)
-- Account-qualified `using { /creator@fortnite.com/... }` paths in `.verse` sources rewritten
+- Verse path reset to UEFN's unbound state (`projectVersePath = ""`, uplugin `VersePath = /invaliddomain/<ProjectName>`)
+- `using { /creator@fortnite.com/... }` paths in `.verse` sources rewritten to match the installed project name (UEFN mounts unbound projects at `/invaliddomain/<ProjectName>`)
 - Removed: `.lore\` revision-control history, `.git\`, `*.code-workspace`, `Content\Developers\`
 - Binary assets (`.umap`/`.uasset`) are **never modified** — UEFN's redirector fixes those on first open
 
