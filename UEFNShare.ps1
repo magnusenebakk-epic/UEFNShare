@@ -10,6 +10,7 @@ $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNShare\settings.json'
 $script:UefnIniPath       = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini'
 $script:VkProjectsIniDir  = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Config\WindowsEditor\VK_Projects'
 $script:LauncherDat       = Join-Path $env:ProgramData 'Epic\UnrealEngineLauncher\LauncherInstalled.dat'
+$script:UefnLogPath       = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Logs\UnrealEditorFortnite.log'
 $script:VerseSentinelRoot = '/invaliddomain'
 $script:StagingDirs       = New-Object System.Collections.ArrayList
 
@@ -232,15 +233,47 @@ function Test-UefnRunning {
 }
 
 function Get-InstalledUefnVersion {
-    # Reads e.g. "++Fortnite+Release-41.30-CL-56430492" from the Epic launcher manifest.
-    if (-not (Test-Path -LiteralPath $script:LauncherDat)) { return $null }
-    try {
-        $raw = Read-TextFileRaw $script:LauncherDat
-        if ($raw -match '\+\+Fortnite\+Release-([\d.]+)-CL-(\d+)') {
-            return [pscustomobject]@{ Version = $Matches[1]; CL = $Matches[2] }
-        }
-    } catch { }
-    return $null
+    # Best-effort detection from two sources, keeping the newest:
+    #  - the launcher manifest's Fortnite_Studio (= UEFN) entry - NOT the first Fortnite
+    #    artifact in the file, which can be the game client or a stale sidecar
+    #  - UEFN's own log, i.e. the build that actually last ran on this machine
+    # Non-launcher/internal UEFN builds may be invisible to both, so callers must treat
+    # this as advisory (warn, never block).
+    $rxVer = '\+\+Fortnite\+Release-([\d.]+)-CL-(\d+)'
+    $candidates = @()
+
+    if (Test-Path -LiteralPath $script:LauncherDat) {
+        try {
+            $dat = Get-Content -LiteralPath $script:LauncherDat -Raw | ConvertFrom-Json
+            $entries = @($dat.InstallationList)
+            $picks = @($entries | Where-Object { $_.AppName -eq 'Fortnite_Studio' })
+            if ($picks.Count -eq 0) { $picks = $entries }
+            foreach ($e in $picks) {
+                if ("$($e.AppVersion)" -match $rxVer) {
+                    $candidates += [pscustomobject]@{ Version = $Matches[1]; CL = $Matches[2]; Source = 'Epic launcher manifest' }
+                }
+            }
+        } catch { }
+    }
+    if (Test-Path -LiteralPath $script:UefnLogPath) {
+        try {
+            # The LogInit build banner sits near the top; don't read multi-MB logs fully.
+            foreach ($line in (Get-Content -LiteralPath $script:UefnLogPath -TotalCount 3000 -ErrorAction Stop)) {
+                if ($line -match ('LogInit: Build: ' + $rxVer)) {
+                    $candidates += [pscustomobject]@{ Version = $Matches[1]; CL = $Matches[2]; Source = 'UEFN log (last run)' }
+                    break
+                }
+            }
+        } catch { }
+    }
+
+    if ($candidates.Count -eq 0) { return $null }
+    $best = $candidates[0]
+    foreach ($c in $candidates) {
+        $cmp = Test-VersionCompatible -Required $best.Version -Installed $c.Version
+        if ($cmp -eq $true -and $c.Version -ne $best.Version) { $best = $c }
+    }
+    return $best
 }
 
 function Test-VersionCompatible {
@@ -320,10 +353,10 @@ function Get-LocalProjects {
             $pf = @(Get-ChildItem -LiteralPath $dir.FullName -Filter '*.uefnproject' -File -ErrorAction SilentlyContinue)
             if ($pf.Count -ne 1) { continue }
             try { $info = Get-ProjectInfo -FolderPath $dir.FullName } catch { continue }
+            # No size scan here: recursively measuring every project makes the picker crawl.
             $results += [pscustomobject]@{
-                Info    = $info
-                Root    = $root
-                ShareMB = Get-FolderSizeMB -Path $dir.FullName -ExcludeTopLevel @('.lore', '.git')
+                Info = $info
+                Root = $root
             }
         }
     }
@@ -775,8 +808,10 @@ function Install-ProjectFromStaging {
     if ($installed) {
         $compat = Test-VersionCompatible -Required $info.CompatibilityVersion -Installed $installed.Version
         if ($compat -eq $false) {
-            Write-Warn ("This project requires UEFN {0} but you have {1}. It may fail to open until UEFN updates." -f $info.CompatibilityVersion, $installed.Version)
-            if (-not (Read-YesNo 'Continue anyway?' -Default $false)) { return }
+            # Detection is advisory: internal/non-launcher UEFN builds are invisible to it.
+            Write-Warn ("This project was saved with UEFN {0}. The newest UEFN detected on this machine is {1} (source: {2})." -f $info.CompatibilityVersion, $installed.Version, $installed.Source)
+            Write-Info ("If your UEFN really is older than {0} the project may fail to open until UEFN updates; if the detection is wrong, just continue." -f $info.CompatibilityVersion)
+            if (-not (Read-YesNo 'Continue?' -Default $true)) { return }
         }
     } else {
         Write-Warn 'Could not detect an installed UEFN version - skipping the compatibility check.'
@@ -951,7 +986,7 @@ function Select-LocalProject {
     }
     $labels = foreach ($p in $projects) {
         $bound = if ($p.Info.IsBound) { $p.Info.ProjectVersePath } else { 'unbound' }
-        "{0}  (title: '{1}', {2}, {3} MB)" -f $p.Info.Name, $p.Info.Title, $bound, $p.ShareMB
+        "{0}  (title: '{1}', {2})" -f $p.Info.Name, $p.Info.Title, $bound
     }
     $pick = Read-MenuChoice -Title $Title -Options @($labels)
     if ($pick -lt 0) { return $null }
@@ -1129,7 +1164,7 @@ author, description, sizeMB, sha256, uefnCompatibilityVersion are recommended.
 
 function Show-Banner {
     $installed = Get-InstalledUefnVersion
-    $uefnLabel = if ($installed) { "UEFN detected: $($installed.Version) (CL $($installed.CL))" } else { 'UEFN install not detected' }
+    $uefnLabel = if ($installed) { "UEFN detected: $($installed.Version) (CL $($installed.CL), $($installed.Source))" } else { 'UEFN install not detected' }
     Write-Host ''
     Write-Host ("UEFNShare v{0}" -f $script:ToolVersion) -ForegroundColor Cyan -NoNewline
     Write-Host ("    {0}" -f $uefnLabel) -ForegroundColor Gray
