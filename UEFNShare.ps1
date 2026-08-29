@@ -4,7 +4,7 @@
 
 #region Constants
 
-$script:ToolVersion       = '1.2.0'
+$script:ToolVersion       = '1.3.0'
 $script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNShare/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNShare\settings.json'
 $script:UefnIniPath       = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini'
@@ -1137,10 +1137,174 @@ function Invoke-DuplicateFlow {
         -PresetTitle $newTitle -PresetFolderName $newFolder -DefaultRoot $sel.Root
 }
 
+function Get-PublisherRepoRoot {
+    # Publisher mode: the script runs from a checkout that holds the catalog (index.json +
+    # .git). Consumers running via 'irm | iex' have no $PSScriptRoot and never see this.
+    if (-not $PSScriptRoot) { return $null }
+    if ((Test-Path -LiteralPath (Join-Path $PSScriptRoot 'index.json')) -and
+        (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.git'))) {
+        return $PSScriptRoot
+    }
+    return $null
+}
+
+function Test-PublisherEnvironment {
+    if ($null -eq (Get-PublisherRepoRoot)) { return $false }
+    if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
+    & gh auth status *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Write-CatalogJson {
+    # Serializes the catalog in the same tab-indented, human-editable style as the repo's
+    # index.json. ConvertTo-Json is avoided: it reformats, \uXXXX-escapes, and writes
+    # locale-dependent-looking output that makes hand edits unpleasant.
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Name = '',
+        [string]$Description = '',
+        [array]$Projects = @()
+    )
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $keys = @('id', 'name', 'title', 'description', 'author', 'version',
+              'uefnCompatibilityVersion', 'sizeMB', 'sha256', 'downloadUrl',
+              'tags', 'screenshotUrl', 'readmeUrl')
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("{`r`n")
+    [void]$sb.Append("`t""schemaVersion"": 1,`r`n")
+    [void]$sb.Append("`t""name"": ""$(ConvertTo-JsonStringLiteral $Name)"",`r`n")
+    [void]$sb.Append("`t""description"": ""$(ConvertTo-JsonStringLiteral $Description)"",`r`n")
+    [void]$sb.Append("`t""updated"": ""$(Get-Date -Format 'yyyy-MM-dd')"",`r`n")
+    [void]$sb.Append("`t""projects"": [")
+    for ($i = 0; $i -lt $Projects.Count; $i++) {
+        $p = $Projects[$i]
+        $lines = @()
+        foreach ($key in $keys) {
+            $prop = $p.PSObject.Properties[$key]
+            if ($null -eq $prop -or $null -eq $prop.Value) { continue }
+            $v = $prop.Value
+            if ($v -is [string]) {
+                $lines += "`t`t`t""$key"": ""$(ConvertTo-JsonStringLiteral $v)"""
+            } elseif ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) {
+                # Invariant culture: a comma decimal separator would corrupt the JSON.
+                $lines += "`t`t`t""$key"": $($v.ToString($inv))"
+            } elseif ($v -is [array]) {
+                $items = @($v | ForEach-Object { '"' + (ConvertTo-JsonStringLiteral ([string]$_)) + '"' })
+                $lines += "`t`t`t""$key"": [$($items -join ', ')]"
+            }
+        }
+        [void]$sb.Append("`r`n`t`t{`r`n")
+        [void]$sb.Append(($lines -join ",`r`n"))
+        [void]$sb.Append("`r`n`t`t}")
+        if ($i -lt ($Projects.Count - 1)) { [void]$sb.Append(',') }
+    }
+    if ($Projects.Count -gt 0) { [void]$sb.Append("`r`n`t") }
+    [void]$sb.Append("]`r`n}`r`n")
+    Write-TextFileNoBom -Path $Path -Text $sb.ToString()
+}
+
+function Invoke-CatalogPublish {
+    # One-command publish: GitHub release with the zip, index.json update, commit, push.
+    # Returns $true on success; any failure returns $false so the caller can fall back to
+    # the manual instructions.
+    param(
+        [Parameter(Mandatory)]$Entry,   # pscustomobject catalog entry
+        [Parameter(Mandatory)][string]$ZipPath
+    )
+    $repo = Get-PublisherRepoRoot
+    try {
+        $remote = (& git -C $repo remote get-url origin 2>$null | Select-Object -First 1)
+        if (-not $remote) { Write-Err 'No git remote named origin in the catalog repo.'; return $false }
+        $slug = $remote.Trim() -replace '^https://github\.com/', '' -replace '^git@github\.com:', '' -replace '\.git$', ''
+        $tag = "$($Entry.id)-$($Entry.version)"
+
+        & gh release view $tag -R $slug *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Err "A release tagged '$tag' already exists on $slug. Bump the version and re-export."
+            return $false
+        }
+
+        Write-Info "Creating release '$tag' on $slug and uploading $(Split-Path $ZipPath -Leaf)..."
+        $notes = if ("$($Entry.description)" -ne '') { "$($Entry.description)" } else { 'Published with UEFNShare.' }
+        & gh release create $tag $ZipPath -R $slug --title "$($Entry.title) $($Entry.version)" --notes $notes
+        if ($LASTEXITCODE -ne 0) { Write-Err 'gh release create failed.'; return $false }
+        $Entry.downloadUrl = "https://github.com/$slug/releases/download/$tag/$(Split-Path $ZipPath -Leaf)"
+
+        $indexPath = Join-Path $repo 'index.json'
+        $catalog = Get-Content -LiteralPath $indexPath -Raw | ConvertFrom-Json
+        $kept = @(@($catalog.projects) | Where-Object { "$($_.id)" -ne "$($Entry.id)" })
+        $replaced = (@($catalog.projects).Count -ne $kept.Count)
+        Write-CatalogJson -Path $indexPath -Name "$($catalog.name)" -Description "$($catalog.description)" `
+            -Projects ($kept + @($Entry))
+
+        & git -C $repo pull --rebase --quiet origin main
+        & git -C $repo add index.json
+        & git -C $repo commit --quiet -m "Add $($Entry.name) v$($Entry.version) to catalog"
+        & git -C $repo push --quiet origin main
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err 'git push failed. The catalog change is committed locally - push it manually.'
+            return $false
+        }
+
+        Write-Ok "Release: $($Entry.downloadUrl)"
+        $note = if ($replaced) { ' (replaced the previous version of this entry)' } else { '' }
+        Write-Ok "Catalog updated and pushed$note. Visible in Browse within ~5 minutes."
+        return $true
+    } catch {
+        Write-Err "Publish failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Show-ExportLint {
+    # Pre-flight shareability report, run on the SOURCE project so file:line references
+    # point at the publisher's real files.
+    param([Parameter(Mandatory)]$Info)
+    Write-Head 'Pre-flight report'
+    $shareMB = Get-FolderSizeMB -Path $Info.FolderPath -ExcludeTopLevel @('.lore', '.git')
+    $compat = if ($Info.CompatibilityVersion) { $Info.CompatibilityVersion } else { 'unknown' }
+    Write-Info ("Recipients need UEFN {0}+.  Package content: ~{1} MB before compression." -f $compat, $shareMB)
+
+    $selfRefs = @()
+    $externalRefs = @()
+    $contentDir = Join-Path $Info.FolderPath 'Content'
+    if (Test-Path -LiteralPath $contentDir) {
+        $found = Get-ChildItem -LiteralPath $contentDir -Recurse -Filter '*.verse' -File -ErrorAction SilentlyContinue |
+            Select-String -Pattern '/[\w.+-]+@fortnite\.com/[A-Za-z0-9_]+' -AllMatches
+        foreach ($hit in $found) {
+            $rel = $hit.Path.Substring($Info.FolderPath.Length + 1)
+            foreach ($m in $hit.Matches) {
+                $projSegment = ($m.Value -split '/')[2]
+                $line = "{0}:{1}  {2}" -f $rel, $hit.LineNumber, $m.Value
+                if ($projSegment -in @($Info.Name, $Info.PluginName)) { $selfRefs += $line }
+                else { $externalRefs += $line }
+            }
+        }
+    }
+    if ($selfRefs.Count -gt 0) {
+        Write-Warn ("{0} absolute reference(s) to this project's own Verse path (rewritten automatically on export; consider relative 'using' forms in your source):" -f $selfRefs.Count)
+        foreach ($r in ($selfRefs | Select-Object -Unique)) { Write-Info "  $r" }
+    }
+    if ($externalRefs.Count -gt 0) {
+        Write-Warn ("{0} reference(s) to OTHER creators' Verse modules - NOT rewritten, and they may not resolve on a recipient's machine:" -f $externalRefs.Count)
+        foreach ($r in ($externalRefs | Select-Object -Unique)) { Write-Info "  $r" }
+    }
+    $urefs = @(Get-ChildItem -LiteralPath (Join-Path $Info.FolderPath 'References') -Filter '*.uref' -File -ErrorAction SilentlyContinue)
+    if ($urefs.Count -gt 0) {
+        Write-Warn ("{0} Fab/marketplace asset reference(s) - recipients may need the matching entitlements or assets can show up missing:" -f $urefs.Count)
+        foreach ($u in $urefs) { Write-Info "  $($u.BaseName)" }
+    }
+    if ($selfRefs.Count -eq 0 -and $externalRefs.Count -eq 0 -and $urefs.Count -eq 0) {
+        Write-Ok 'No shareability issues found.'
+    }
+}
+
 function Invoke-ExportFlow {
     $sel = Select-LocalProject -Title 'Export a project for sharing'
     if ($null -eq $sel) { return }
     $info = $sel.Info
+
+    Show-ExportLint -Info $info
 
     if (Test-UefnRunning) {
         Write-Warn 'UEFN is running. For a clean export, close UEFN so no files are mid-write.'
@@ -1184,10 +1348,21 @@ function Invoke-ExportFlow {
         sha256                   = $sha
         downloadUrl              = "https://github.com/magnusenebakk-epic/UEFNShare/releases/download/<tag>/$($zipItem.Name)"
     }
-    $entryJson = [pscustomobject]$entry | ConvertTo-Json -Depth 5
+    $entryObj = [pscustomobject]$entry
 
     Write-Host ''
     Write-Ok "Packaged: $zipPath ($sizeMB MB)"
+
+    # Publisher machine (catalog repo + authenticated gh): offer to finish the job here.
+    if (Test-PublisherEnvironment) {
+        Write-Host ''
+        if (Read-YesNo 'Publish now? (creates the GitHub release, updates index.json, pushes)' -Default $true) {
+            if (Invoke-CatalogPublish -Entry $entryObj -ZipPath $zipPath) { return }
+            Write-Warn 'Automatic publish did not complete - falling back to the manual steps below.'
+        }
+    }
+
+    $entryJson = $entryObj | ConvertTo-Json -Depth 5
     Write-Host ''
     Write-Host 'Catalog entry (paste into the "projects" array of your index.json):' -ForegroundColor White
     Write-Host $entryJson

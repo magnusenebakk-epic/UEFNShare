@@ -76,7 +76,11 @@ Required per entry: `id`, `name`, `title`, `version`, `downloadUrl`. Recommended
 
 ### Publishing workflow
 
-1. Run UEFNShare → **Export** → pick your project. You get a sanitized zip in `dist\` plus a ready-to-paste catalog entry (offered to your clipboard, including the computed `sha256` and `sizeMB`).
+Run UEFNShare **from this repo folder** (e.g. via `UEFNShare.cmd`) → **Export** → pick your project. Export shows a pre-flight report (absolute Verse paths, Fab asset dependencies, required UEFN version), builds the sanitized zip, and — if the [GitHub CLI](https://cli.github.com/) is installed and logged in — offers to **publish in one step**: it creates the GitHub release with the zip attached, adds the entry to `index.json` (replacing an older version of the same demo), commits and pushes. The demo appears in everyone's Browse within ~5 minutes.
+
+Without `gh` (or when declined), Export falls back to manual mode:
+
+1. You get the zip in `dist\` plus a ready-to-paste catalog entry (offered to your clipboard, including the computed `sha256` and `sizeMB`).
 2. Upload the zip to a GitHub Release of this repo.
 3. Fix the `downloadUrl` in the entry, paste it into `index.json`'s `projects` array, commit and push.
 
