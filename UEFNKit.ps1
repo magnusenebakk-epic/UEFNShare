@@ -4,7 +4,7 @@
 
 #region Constants
 
-$script:ToolVersion       = '2.0.0'
+$script:ToolVersion       = '2.1.0'
 $script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNKit/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNKit\settings.json'
 # Pre-rename locations (the tool used to be called UEFNShare); read as fallback.
@@ -467,6 +467,30 @@ function Get-LocalProjects {
                 Root = $root
             }
         }
+    }
+    # Variant detection: a project whose projectId appears in another project's
+    # variants.lock.json is a generated variant of that root. The lock is the single
+    # source of truth - no marker files inside variants, nothing to go stale.
+    $ownerByProjectId = @{}
+    foreach ($p in $results) {
+        $lockPath = Join-Path $p.Info.FolderPath 'variants.lock.json'
+        if (-not (Test-Path -LiteralPath $lockPath)) { continue }
+        try {
+            $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+            if ($lock.PSObject.Properties['variants']) {
+                foreach ($vp in $lock.variants.PSObject.Properties) {
+                    $vid = "$($vp.Value.projectId)"
+                    if ($vid -ne '') { $ownerByProjectId[$vid] = $p.Info.Name }
+                }
+            }
+        } catch { }
+    }
+    foreach ($p in $results) {
+        $variantOf = ''
+        if ($ownerByProjectId.ContainsKey($p.Info.ProjectId) -and $ownerByProjectId[$p.Info.ProjectId] -ne $p.Info.Name) {
+            $variantOf = $ownerByProjectId[$p.Info.ProjectId]
+        }
+        $p | Add-Member -NotePropertyName VariantOf -NotePropertyValue $variantOf
     }
     return $results
 }
@@ -1247,7 +1271,7 @@ function New-VariantsManifestInteractive {
 }
 
 function Invoke-VariantsFlow {
-    $sel = Select-LocalProject -Title 'Generate variants of a project (pick the ROOT)'
+    $sel = Select-LocalProject -Title 'Generate variants of a project (pick the ROOT)' -ExcludeVariants
     if ($null -eq $sel) { return }
     $info = $sel.Info
 
@@ -1490,17 +1514,31 @@ function Invoke-LocalInstallFlow {
 }
 
 function Select-LocalProject {
-    param([string]$Title = 'Select a project')
-    $projects = @(Get-LocalProjects)
+    param(
+        [string]$Title = 'Select a project',
+        [switch]$ExcludeVariants  # for flows that only make sense on a root project
+    )
+    $all = @(Get-LocalProjects)
+    $projects = $all
+    $hidden = @()
+    if ($ExcludeVariants) {
+        $projects = @($all | Where-Object { $_.VariantOf -eq '' })
+        $hidden = @($all | Where-Object { $_.VariantOf -ne '' })
+    }
     if ($projects.Count -eq 0) {
         Write-Warn "No UEFN projects found under: $((Get-AllProjectRoots) -join '; ')"
         return $null
     }
+    if ($Title -ne '') { Write-Head $Title }
+    if ($hidden.Count -gt 0) {
+        Write-Info ("({0} generated variant(s) hidden: {1} - pick their root instead)" -f $hidden.Count, (@($hidden | ForEach-Object { $_.Info.Name }) -join ', '))
+    }
     $labels = foreach ($p in $projects) {
         $bound = if ($p.Info.IsBound) { $p.Info.ProjectVersePath } else { 'unbound' }
-        "{0}  (title: '{1}', {2})" -f $p.Info.Name, $p.Info.Title, $bound
+        $tag = if ($p.VariantOf -ne '') { ", variant of $($p.VariantOf)" } else { '' }
+        "{0}  (title: '{1}', {2}{3})" -f $p.Info.Name, $p.Info.Title, $bound, $tag
     }
-    $pick = Read-MenuChoice -Title $Title -Options @($labels)
+    $pick = Read-MenuChoice -Options @($labels)
     if ($pick -lt 0) { return $null }
     return $projects[$pick]
 }
@@ -1710,6 +1748,11 @@ function Invoke-ExportFlow {
     $sel = Select-LocalProject -Title 'Export a project for sharing'
     if ($null -eq $sel) { return }
     $info = $sel.Info
+
+    if ($sel.VariantOf -ne '') {
+        Write-Warn "'$($info.Name)' is a generated variant of '$($sel.VariantOf)'. You usually want to export the root."
+        if (-not (Read-YesNo 'Export this variant anyway?' -Default $false)) { return }
+    }
 
     Show-ExportLint -Info $info
 
