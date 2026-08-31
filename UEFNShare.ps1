@@ -4,7 +4,7 @@
 
 #region Constants
 
-$script:ToolVersion       = '1.3.0'
+$script:ToolVersion       = '1.3.1'
 $script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNShare/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNShare\settings.json'
 $script:UefnIniPath       = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini'
@@ -1230,6 +1230,13 @@ function Invoke-CatalogPublish {
         if ($LASTEXITCODE -ne 0) { Write-Err 'gh release create failed.'; return $false }
         $Entry.downloadUrl = "https://github.com/$slug/releases/download/$tag/$(Split-Path $ZipPath -Leaf)"
 
+        # Sync BEFORE touching index.json: pull-with-rebase needs a clean tree, and reading
+        # the catalog after the pull merges the entry against the latest remote state.
+        & git -C $repo pull --rebase --autostash --quiet origin main
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn 'Could not sync with the remote first - continuing with the local index.json.'
+        }
+
         $indexPath = Join-Path $repo 'index.json'
         $catalog = Get-Content -LiteralPath $indexPath -Raw | ConvertFrom-Json
         $kept = @(@($catalog.projects) | Where-Object { "$($_.id)" -ne "$($Entry.id)" })
@@ -1237,9 +1244,9 @@ function Invoke-CatalogPublish {
         Write-CatalogJson -Path $indexPath -Name "$($catalog.name)" -Description "$($catalog.description)" `
             -Projects ($kept + @($Entry))
 
-        & git -C $repo pull --rebase --quiet origin main
         & git -C $repo add index.json
         & git -C $repo commit --quiet -m "Add $($Entry.name) v$($Entry.version) to catalog"
+        if ($LASTEXITCODE -ne 0) { Write-Err 'git commit failed - index.json was updated but not committed.'; return $false }
         & git -C $repo push --quiet origin main
         if ($LASTEXITCODE -ne 0) {
             Write-Err 'git push failed. The catalog change is committed locally - push it manually.'
