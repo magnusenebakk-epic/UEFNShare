@@ -20,7 +20,7 @@ Or download this repo as a zip, extract it, and double-click **`UEFNKit.cmd`** (
   [1] Browse catalog and install       - pick a project from an online catalog, download, install
   [2] Install from local zip or folder - install a project someone sent you (source is never modified)
   [3] Duplicate one of my projects     - copy a local project as a fresh, independent project
-  [4] Generate variants of a project   - 4v4/3v3/2v2/1v1 variations from one root (see below)
+  [4] Generate variants of a project   - build variations of one root project (see below)
   [5] Export one of my projects        - build a shareable zip with your identity stripped
   [6] Remove an installed project      - delete a project plus UEFN's editor-generated state for it
   [7] Settings                         - catalog URL, projects folder override
@@ -41,29 +41,29 @@ Everything is prompted step by step, and every prompt that can be auto-detected 
 
 UEFN's central configuration, your trusted-projects list, and your Epic / revision-control login tokens. When you first open an installed project, UEFN shows its standard **Verse code trust prompt** — review it before accepting; that prompt is the security boundary for running code somebody else wrote.
 
-## Variants: one root project, many team sizes
+## Variants: one root project, many variations
 
-Games like "Boxfights 4v4 / 3v3 / 2v2 / 1v1" are usually near-identical projects that differ only in island matchmaking settings, a few gameplay values, and some cosmetics. Instead of duplicating and hand-editing each one, keep a single **root project** with a `variants.json` next to its Content folder (the tool offers to create it interactively):
+Some games ship as a family of near-identical projects that differ only in island matchmaking settings, a few gameplay values, and some cosmetics. Instead of duplicating and hand-editing each one, keep a single **root project** with a `variants.json` next to its Content folder (the tool offers to create it interactively):
 
 ```json
 {
 	"defaults": { "TeamSize": 4, "RoundTime": 120.0 },
 	"variants": [
-		{ "suffix": "4v4", "title": "Boxfights 4v4",
+		{ "suffix": "Large", "title": "My Game Large",
 		  "matchmaking": { "maxTeamSize": 4, "maxTeamCount": 2, "maxPlayers": 8 },
 		  "verseConfig": { "TeamSize": 4 } },
-		{ "suffix": "1v1", "title": "Boxfights 1v1",
+		{ "suffix": "Small", "title": "My Game Small",
 		  "matchmaking": { "maxTeamSize": 1, "maxTeamCount": 2, "maxPlayers": 2 },
 		  "verseConfig": { "TeamSize": 1, "RoundTime": 60.0 } }
 	]
 }
 ```
 
-**Generate variants** then creates `Boxfights4v4`, `Boxfights1v1`, ... next to the root. Each variant gets the root's content, the matchmaking overrides patched into its `.uefnproject`, and a generated `Content\VariantConfig.verse` — a module of constants (`defaults` merged with the variant's `verseConfig`) that your gameplay code reads:
+**Generate variants** then creates `MyGameLarge`, `MyGameSmall`, ... next to the root. Each variant gets the root's content, the matchmaking overrides patched into its `.uefnproject`, and a generated `Content\VariantConfig.verse` — a module of constants (`defaults` merged with the variant's `verseConfig`) that your gameplay code reads:
 
 ```verse
 using { VariantConfig }
-# VariantConfig.TeamSize is 4 in the 4v4 project and 1 in the 1v1 project
+# VariantConfig.TeamSize differs per generated variant project
 ```
 
 Drive per-variant visuals the same way: author all variant props once and show/hide (or swap materials/UI text) at game start based on the config. The level stays identical across variants; only text differs — which is what makes the whole thing automatable.

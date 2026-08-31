@@ -1920,8 +1920,8 @@ project to YOUR account and it behaves as if you created it.
                      is never modified.
   Duplicate          Copies one of your own projects as a fresh, independent
                      project (new GUIDs, unbound - UEFN re-binds it on open).
-  Variants           Generates team-size (or any) variations of a root project
-                     from a variants.json manifest: per-variant island matchmaking
+  Variants           Generates variations of a root project from a variants.json
+                     manifest: per-variant island matchmaking
                      settings, a generated VariantConfig Verse module of constants,
                      fresh identity on first creation. Re-running syncs the root's
                      content into existing variants after a confirmation - their
@@ -1968,7 +1968,7 @@ function Main {
             'Browse catalog and install',
             'Install from local zip or folder',
             'Duplicate one of my projects',
-            'Generate variants of a project (4v4/3v3/...)',
+            'Generate variants of a project',
             'Export one of my projects for sharing',
             'Remove an installed project',
             'Settings',
