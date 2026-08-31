@@ -1,18 +1,18 @@
-# UEFNShare
+# UEFNKit
 
 Install, duplicate and package **UEFN (Unreal Editor for Fortnite) projects** so they can be shared between people.
 
-A UEFN project carries identifiers that tie it to its creator's Epic account: the project and module GUIDs, the account Verse path (`/you@fortnite.com/Project`), and the Unreal Revision Control database (`.lore\`). If you just copy a project to someone else's machine, it stays bound to *you*. UEFNShare resets all of that to the exact state UEFN uses for a brand-new, never-opened project — so on first open, UEFN binds the project to the *new* owner's account and it behaves as if they created it.
+A UEFN project carries identifiers that tie it to its creator's Epic account: the project and module GUIDs, the account Verse path (`/you@fortnite.com/Project`), and the Unreal Revision Control database (`.lore\`). If you just copy a project to someone else's machine, it stays bound to *you*. UEFNKit resets all of that to the exact state UEFN uses for a brand-new, never-opened project — so on first open, UEFN binds the project to the *new* owner's account and it behaves as if they created it.
 
 ## Run it
 
 Paste this into any PowerShell window:
 
 ```powershell
-irm https://raw.githubusercontent.com/magnusenebakk-epic/UEFNShare/main/UEFNShare.ps1 | iex
+irm https://raw.githubusercontent.com/magnusenebakk-epic/UEFNKit/main/UEFNKit.ps1 | iex
 ```
 
-Or download this repo as a zip, extract it, and double-click **`UEFNShare.cmd`** (no admin rights needed; if Windows shows an "Open File – Security Warning" once, click Run).
+Or download this repo as a zip, extract it, and double-click **`UEFNKit.cmd`** (no admin rights needed; if Windows shows an "Open File – Security Warning" once, click Run).
 
 ## What it does
 
@@ -106,7 +106,7 @@ Required per entry: `id`, `name`, `title`, `version`, `downloadUrl`. Recommended
 
 ### Publishing workflow
 
-Run UEFNShare **from this repo folder** (e.g. via `UEFNShare.cmd`) → **Export** → pick your project. Export shows a pre-flight report (absolute Verse paths, Fab asset dependencies, required UEFN version), builds the sanitized zip, and — if the [GitHub CLI](https://cli.github.com/) is installed and logged in — offers to **publish in one step**: it creates the GitHub release with the zip attached, adds the entry to `index.json` (replacing an older version of the same demo), commits and pushes. The demo appears in everyone's Browse within ~5 minutes.
+Run UEFNKit **from this repo folder** (e.g. via `UEFNKit.cmd`) → **Export** → pick your project. Export shows a pre-flight report (absolute Verse paths, Fab asset dependencies, required UEFN version), builds the sanitized zip, and — if the [GitHub CLI](https://cli.github.com/) is installed and logged in — offers to **publish in one step**: it creates the GitHub release with the zip attached, adds the entry to `index.json` (replacing an older version of the same demo), commits and pushes. The demo appears in everyone's Browse within ~5 minutes.
 
 Without `gh` (or when declined), Export falls back to manual mode:
 

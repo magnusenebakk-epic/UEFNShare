@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
 	"name": "Magnus' UEFN Demos",
-	"description": "Shareable UEFN sample projects - install with UEFNShare",
+	"description": "Shareable UEFN sample projects - install with UEFNKit",
 	"updated": "2026-08-31",
 	"projects": [
 		{
@@ -14,7 +14,7 @@
 			"uefnCompatibilityVersion": "42.00",
 			"sizeMB": 3.6,
 			"sha256": "9f9e9a82f4860d812c704f608cfa1bffb869ed8146b74553600afee28e6e7bd2",
-			"downloadUrl": "https://github.com/magnusenebakk-epic/UEFNShare/releases/download/mobilegames-1.0.0/MobileGames-1.0.0.zip"
+			"downloadUrl": "https://github.com/magnusenebakk-epic/UEFNKit/releases/download/mobilegames-1.0.0/MobileGames-1.0.0.zip"
 		}
 	]
 }
