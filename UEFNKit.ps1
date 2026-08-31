@@ -4,7 +4,7 @@
 
 #region Constants
 
-$script:ToolVersion       = '2.2.0'
+$script:ToolVersion       = '2.3.0'
 $script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNKit/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNKit\settings.json'
 # Pre-rename locations (the tool used to be called UEFNShare); read as fallback.
@@ -16,6 +16,16 @@ $script:LauncherDat       = Join-Path $env:ProgramData 'Epic\UnrealEngineLaunche
 $script:UefnLogPath       = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Logs\UnrealEditorFortnite.log'
 $script:VerseSentinelRoot = '/invaliddomain'
 $script:StagingDirs       = New-Object System.Collections.ArrayList
+$script:RawScriptUrl      = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNKit/main/UEFNKit.ps1'
+
+# Box-drawing characters built from code points: the script file stays pure ASCII, which
+# PowerShell 5.1 requires for BOM-less files.
+$script:BoxH  = [string][char]0x2500
+$script:BoxV  = [string][char]0x2502
+$script:BoxTL = [string][char]0x250C
+$script:BoxTR = [string][char]0x2510
+$script:BoxBL = [string][char]0x2514
+$script:BoxBR = [string][char]0x2518
 
 # TLS 1.2 for PS 5.1 talking to GitHub
 try {
@@ -29,7 +39,15 @@ try {
 function Write-Head {
     param([string]$Text)
     Write-Host ''
-    Write-Host "=== $Text ===" -ForegroundColor Cyan
+    if (Test-InteractiveConsole) {
+        $width = [Math]::Min(64, [Math]::Max(24, [Console]::WindowWidth - 2))
+        $tail = [Math]::Max(2, $width - $Text.Length - 6)
+        Write-Host (($script:BoxH * 2) + ' ') -ForegroundColor DarkCyan -NoNewline
+        Write-Host $Text -ForegroundColor Cyan -NoNewline
+        Write-Host (' ' + ($script:BoxH * $tail)) -ForegroundColor DarkCyan
+    } else {
+        Write-Host "=== $Text ===" -ForegroundColor Cyan
+    }
 }
 
 function Write-Ok   { param([string]$Text) Write-Host "[OK] $Text" -ForegroundColor Green }
@@ -70,6 +88,57 @@ function Read-YesNo {
         [Parameter(Mandatory)][string]$Message,
         [bool]$Default = $true
     )
+    if (Test-InteractiveConsole) {
+        $width = [Math]::Max(20, [Console]::WindowWidth - 1)
+        # Long questions get their own line so the single-line redraw never wraps.
+        $prompt = $Message
+        if (($prompt.Length + 36) -gt $width) {
+            Write-Host $Message -ForegroundColor White
+            $prompt = 'Confirm'
+        }
+        $top = [Console]::CursorTop
+        $cursorWasVisible = $true
+        try { $cursorWasVisible = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch { }
+        $sel = $Default
+        $confirmed = $false
+        try {
+            while (-not $confirmed) {
+                [Console]::SetCursorPosition(0, $top)
+                Write-Host ($prompt + '  ') -ForegroundColor White -NoNewline
+                if ($sel) {
+                    Write-Host ' Yes ' -ForegroundColor Black -BackgroundColor Green -NoNewline
+                    Write-Host '  ' -NoNewline
+                    Write-Host ' No ' -ForegroundColor DarkGray -NoNewline
+                } else {
+                    Write-Host ' Yes ' -ForegroundColor DarkGray -NoNewline
+                    Write-Host '  ' -NoNewline
+                    Write-Host ' No ' -ForegroundColor Black -BackgroundColor Red -NoNewline
+                }
+                Write-Host '   y/n, arrows, Enter' -ForegroundColor DarkGray -NoNewline
+                $key = [Console]::ReadKey($true)
+                switch ($key.Key) {
+                    'LeftArrow'  { $sel = $true }
+                    'RightArrow' { $sel = $false }
+                    'UpArrow'    { $sel = -not $sel }
+                    'DownArrow'  { $sel = -not $sel }
+                    'Y'          { $sel = $true;  $confirmed = $true }
+                    'N'          { $sel = $false; $confirmed = $true }
+                    'Enter'      { $confirmed = $true }
+                    'Escape'     { $sel = $false; $confirmed = $true }
+                }
+            }
+        } finally {
+            try { [Console]::CursorVisible = $cursorWasVisible } catch { }
+        }
+        [Console]::SetCursorPosition(0, $top)
+        Write-Host (' ' * $width) -NoNewline
+        [Console]::SetCursorPosition(0, $top)
+        Write-Host ($prompt + '  ') -ForegroundColor White -NoNewline
+        if ($sel) { Write-Host 'Yes' -ForegroundColor Green } else { Write-Host 'No' -ForegroundColor Red }
+        return $sel
+    }
+
+    # Typed fallback for redirected input/output.
     $hint = if ($Default) { '[y/n, Enter = yes]' } else { '[y/n, Enter = no]' }
     while ($true) {
         Write-Host $Message -ForegroundColor White -NoNewline
@@ -102,6 +171,7 @@ function Read-MenuChoice {
     param(
         [string]$Title = '',
         [Parameter(Mandatory)][string[]]$Options,
+        [string[]]$Descriptions = @(),  # optional, parallel to Options; shown for the highlighted item
         [string]$BackLabel = 'Back',
         [string]$DefaultChoice = ''
     )
@@ -139,9 +209,10 @@ function Read-MenuChoice {
 
     # Lines longer than the console width would wrap and break in-place redrawing.
     $width = [Math]::Max(20, [Console]::WindowWidth - 1)
-    $view = [Math]::Min($items.Count, [Math]::Max(4, [Console]::WindowHeight - 6))
+    $view = [Math]::Min($items.Count, [Math]::Max(4, [Console]::WindowHeight - 7))
     $offset = [Math]::Max(0, [Math]::Min($sel, $items.Count - $view))
-    $totalLines = $view + 1
+    $hasDescs = ($Descriptions.Count -gt 0)
+    $totalLines = $view + 1 + $(if ($hasDescs) { 1 } else { 0 })
 
     # Reserve the lines first so the top row is stable even if the buffer scrolls.
     for ($i = 0; $i -lt $totalLines; $i++) { Write-Host '' }
@@ -161,10 +232,15 @@ function Read-MenuChoice {
                 $line = "$num. $($items[$i])"
                 if ($line.Length -gt ($width - 5)) { $line = $line.Substring(0, $width - 8) + '...' }
                 if ($i -eq $sel) {
-                    Write-Host ('> ' + $line).PadRight($width) -ForegroundColor Cyan
+                    Write-Host ('> ' + $line).PadRight($width) -ForegroundColor Black -BackgroundColor Cyan
                 } else {
                     Write-Host ('  ' + $line).PadRight($width)
                 }
+            }
+            if ($hasDescs) {
+                $desc = if ($sel -lt $Descriptions.Count -and $null -ne $Descriptions[$sel]) { "$($Descriptions[$sel])" } else { '' }
+                if ($desc.Length -gt ($width - 5)) { $desc = $desc.Substring(0, $width - 8) + '...' }
+                Write-Host ('    ' + $desc).PadRight($width) -ForegroundColor DarkGray
             }
             $scrollNote = if ($items.Count -gt $view) { " ($($sel + 1)/$($items.Count))" } else { '' }
             $hint = "  Up/Down move, Enter select, Esc = $BackLabel$scrollNote"
@@ -194,11 +270,13 @@ function Read-MenuChoice {
             if ($confirmed) { break }
         }
 
-        # Blank the hint line and leave a one-line record of the choice.
+        # Blank the desc/hint lines and leave a one-line record of the choice.
         [Console]::SetCursorPosition(0, $top + $view)
+        if ($hasDescs) { Write-Host (' ' * $width) }
         Write-Host (' ' * $width) -NoNewline
         [Console]::SetCursorPosition(0, $top + $view)
-        Write-Host ("Selected: {0}" -f $items[$sel]) -ForegroundColor White
+        Write-Host 'Selected: ' -ForegroundColor DarkGray -NoNewline
+        Write-Host $items[$sel] -ForegroundColor Cyan
     } finally {
         try { [Console]::CursorVisible = $cursorWasVisible } catch { }
     }
@@ -1459,7 +1537,10 @@ function Invoke-BrowseCatalogFlow {
         "$($e.title)$meta$compatNote"
     }
 
-    $pick = Read-MenuChoice -Title $catName -Options @($labels)
+    $descs = foreach ($e in $entries) {
+        if ($e.PSObject.Properties['description'] -and $e.description) { "$($e.description)" } else { '' }
+    }
+    $pick = Read-MenuChoice -Title $catName -Options @($labels) -Descriptions @($descs)
     if ($pick -lt 0) { return }
     $entry = $entries[$pick]
 
@@ -1538,7 +1619,8 @@ function Select-LocalProject {
         $tag = if ($p.VariantOf -ne '') { ", variant of $($p.VariantOf)" } else { '' }
         "{0}  (title: '{1}', {2}{3})" -f $p.Info.Name, $p.Info.Title, $bound, $tag
     }
-    $pick = Read-MenuChoice -Options @($labels)
+    $descs = @($projects | ForEach-Object { $_.Info.FolderPath })
+    $pick = Read-MenuChoice -Options @($labels) -Descriptions $descs
     if ($pick -lt 0) { return $null }
     return $projects[$pick]
 }
@@ -2112,36 +2194,73 @@ author, description, sizeMB, sha256, uefnCompatibilityVersion are recommended.
 "@
 }
 
+function Test-ToolUpdateAvailable {
+    # Only relevant when running a downloaded copy from disk; 'irm | iex' users are always
+    # current. Best-effort with a short timeout - never blocks or errors the startup.
+    if (-not $PSScriptRoot) { return }
+    try {
+        $raw = Invoke-RestMethod -Uri $script:RawScriptUrl -UseBasicParsing -TimeoutSec 3
+        if ("$raw" -match "ToolVersion\s+=\s+'([\d.]+)'") {
+            $remote = [version]$Matches[1]
+            if ($remote -gt [version]$script:ToolVersion) {
+                Write-Warn "UEFNKit $remote is available (you are running $script:ToolVersion). Update with 'git pull' in the tool's folder, or re-download it."
+            }
+        }
+    } catch { }
+}
+
 function Show-Banner {
     $installed = Get-InstalledUefnVersion
-    $uefnLabel = if ($installed) { "UEFN detected: $($installed.Version) (CL $($installed.CL), $($installed.Source))" } else { 'UEFN install not detected' }
+    $lines = @()
+    $lines += @{ Text = "UEFNKit v$script:ToolVersion"; Color = 'Cyan' }
+    if ($installed) {
+        $lines += @{ Text = "UEFN $($installed.Version) (CL $($installed.CL), $($installed.Source))"; Color = 'Gray' }
+    } else {
+        $lines += @{ Text = 'UEFN install not detected'; Color = 'Yellow' }
+    }
+    $lines += @{ Text = "Projects: $(Get-ProjectsRoot)"; Color = 'Gray' }
+    $owner = Get-ManagedCatalogInfo
+    if ($owner) { $lines += @{ Text = "Catalog owner: $($owner.Slug)"; Color = 'Green' } }
+
     Write-Host ''
-    Write-Host ("UEFNKit v{0}" -f $script:ToolVersion) -ForegroundColor Cyan -NoNewline
-    Write-Host ("    {0}" -f $uefnLabel) -ForegroundColor Gray
-    Write-Host ("Projects folder: {0}" -f (Get-ProjectsRoot)) -ForegroundColor Gray
+    if (Test-InteractiveConsole) {
+        $inner = [Math]::Min(74, [Math]::Max(40, [Console]::WindowWidth - 3))
+        Write-Host ($script:BoxTL + ($script:BoxH * $inner) + $script:BoxTR) -ForegroundColor DarkCyan
+        foreach ($l in $lines) {
+            $t = ' ' + $l.Text
+            if ($t.Length -gt $inner) { $t = $t.Substring(0, $inner - 3) + '...' }
+            Write-Host $script:BoxV -ForegroundColor DarkCyan -NoNewline
+            Write-Host $t.PadRight($inner) -ForegroundColor $l.Color -NoNewline
+            Write-Host $script:BoxV -ForegroundColor DarkCyan
+        }
+        Write-Host ($script:BoxBL + ($script:BoxH * $inner) + $script:BoxBR) -ForegroundColor DarkCyan
+    } else {
+        foreach ($l in $lines) { Write-Host $l.Text -ForegroundColor $l.Color }
+    }
     Write-Host 'Prompts show a suggested value in [brackets] - press Enter to accept it, or type your own.' -ForegroundColor DarkGray
+    Test-ToolUpdateAvailable
 }
 
 function Main {
     Show-Banner
     while ($true) {
         $items = @(
-            @{ Label = 'Browse catalog and install';            Action = { Invoke-BrowseCatalogFlow } },
-            @{ Label = 'Install from local zip or folder';      Action = { Invoke-LocalInstallFlow } },
-            @{ Label = 'Duplicate one of my projects';          Action = { Invoke-DuplicateFlow } },
-            @{ Label = 'Generate variants of a project';        Action = { Invoke-VariantsFlow } },
-            @{ Label = 'Export one of my projects for sharing'; Action = { Invoke-ExportFlow } },
-            @{ Label = 'Remove an installed project';           Action = { Invoke-RemoveFlow } }
+            @{ Label = 'Browse catalog and install';            Desc = 'Pick a project from the online catalog, download and install it';    Action = { Invoke-BrowseCatalogFlow } },
+            @{ Label = 'Install from local zip or folder';      Desc = 'Install a project someone sent you - the source is never modified';   Action = { Invoke-LocalInstallFlow } },
+            @{ Label = 'Duplicate one of my projects';          Desc = 'Copy a local project as a fresh, independent project';                Action = { Invoke-DuplicateFlow } },
+            @{ Label = 'Generate variants of a project';        Desc = 'Create or update variations of a root project from variants.json';    Action = { Invoke-VariantsFlow } },
+            @{ Label = 'Export one of my projects for sharing'; Desc = 'Build a shareable zip with your identity stripped';                   Action = { Invoke-ExportFlow } },
+            @{ Label = 'Remove an installed project';           Desc = 'Delete a project plus the editor state UEFN keeps for it';            Action = { Invoke-RemoveFlow } }
         )
         # Owner-only: shown when the configured catalog is provably the one in this repo.
         if (Get-ManagedCatalogInfo) {
-            $items += @{ Label = 'Manage my catalog'; Action = { Invoke-CatalogManageFlow } }
+            $items += @{ Label = 'Manage my catalog'; Desc = 'Delete catalog entries and optionally their GitHub releases'; Action = { Invoke-CatalogManageFlow } }
         }
-        $items += @{ Label = 'Settings'; Action = { Invoke-SettingsFlow } }
-        $items += @{ Label = 'Help'; Action = { Show-Help } }
+        $items += @{ Label = 'Settings'; Desc = 'Catalog URL and projects folder override'; Action = { Invoke-SettingsFlow } }
+        $items += @{ Label = 'Help'; Desc = 'What each action does and how the catalog works'; Action = { Show-Help } }
 
         $pick = Read-MenuChoice -Title 'Main menu' -Options @($items | ForEach-Object { $_.Label }) `
-            -BackLabel 'Quit' -DefaultChoice '1'
+            -Descriptions @($items | ForEach-Object { $_.Desc }) -BackLabel 'Quit' -DefaultChoice '1'
         try {
             if ($pick -lt 0) { Remove-AllStagingDirs; return }
             & $items[$pick].Action
