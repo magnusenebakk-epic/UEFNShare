@@ -1,10 +1,30 @@
 # UEFNKit - share, install, duplicate and package UEFN projects.
 # Single-file, zero-dependency, Windows PowerShell 5.1 compatible.
 # Run:  irm <raw-url>/UEFNKit.ps1 | iex     or     UEFNKit.cmd
+# Headless/automation:  powershell -ExecutionPolicy Bypass -File UEFNKit.ps1 <command> [options]
+# (see AGENTS.md or 'UEFNKit.ps1 help' for the command reference)
+param(
+    [Parameter(Position = 0)][string]$Command = '',
+    [string]$Path = '',          # install: source zip or folder
+    [string]$Project = '',       # duplicate/variants/export/remove: project name or folder path
+    [string]$Name = '',          # install/duplicate: name for the new project
+    [string]$Title = '',         # display title override
+    [string]$Id = '',            # install/catalog-remove: catalog entry id
+    [string]$Version = '',       # export: package version (default 1.0.0)
+    [string]$Author = '',        # export: author override
+    [string]$Description = '',   # export: description override
+    [string]$OutDir = '',        # export: output folder for the zip
+    [string]$ProjectsRoot = '',  # install/duplicate: target projects folder override
+    [string]$CatalogUrl = '',    # catalog/install: catalog URL override
+    [switch]$Yes,                # required consent for destructive/overwriting commands
+    [switch]$Json,               # machine-readable result output
+    [switch]$Publish,            # export: publish to the catalog (owner machine with gh)
+    [switch]$DeleteRelease       # catalog-remove: also delete the entry's GitHub release
+)
 
 #region Constants
 
-$script:ToolVersion       = '2.3.0'
+$script:ToolVersion       = '2.4.0'
 $script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNKit/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNKit\settings.json'
 # Pre-rename locations (the tool used to be called UEFNShare); read as fallback.
@@ -26,6 +46,9 @@ $script:BoxTL = [string][char]0x250C
 $script:BoxTR = [string][char]0x2510
 $script:BoxBL = [string][char]0x2514
 $script:BoxBR = [string][char]0x2518
+
+# Headless mode: prompts auto-resolve to their defaults (logged), menus are errors.
+$script:NonInteractive = $false
 
 # TLS 1.2 for PS 5.1 talking to GitHub
 try {
@@ -62,6 +85,11 @@ function Read-Prompt {
         [string]$Default = '',
         [switch]$AllowEmpty
     )
+    if ($script:NonInteractive) {
+        if ($Default -ne '') { Write-Info "(auto) ${Message}: $Default"; return $Default }
+        if ($AllowEmpty) { return '' }
+        throw "Headless mode has no value for '$Message' - pass it as a parameter."
+    }
     while ($true) {
         if ($Default -ne '') {
             Write-Host $Message -ForegroundColor White -NoNewline
@@ -88,6 +116,11 @@ function Read-YesNo {
         [Parameter(Mandatory)][string]$Message,
         [bool]$Default = $true
     )
+    if ($script:NonInteractive) {
+        $ans = if ($Default) { 'yes' } else { 'no' }
+        Write-Info "(auto) ${Message}: $ans"
+        return $Default
+    }
     if (Test-InteractiveConsole) {
         $width = [Math]::Max(20, [Console]::WindowWidth - 1)
         # Long questions get their own line so the single-line redraw never wraps.
@@ -175,6 +208,9 @@ function Read-MenuChoice {
         [string]$BackLabel = 'Back',
         [string]$DefaultChoice = ''
     )
+    if ($script:NonInteractive) {
+        throw "Headless mode cannot present the '$Title' menu - use a CLI command instead (see 'UEFNKit.ps1 help')."
+    }
     if ($Title -ne '') { Write-Head $Title }
 
     if (-not (Test-InteractiveConsole)) {
@@ -2274,7 +2310,292 @@ function Main {
 
 #endregion
 
-# Entry point. Set UEFNKIT_NO_MAIN=1 to load the functions without running the menu (tests).
+#region CLI (headless commands for automation and AI agents)
+
+function Resolve-CliProject {
+    # -Project accepts a project folder path or a project name found in the scan roots.
+    param([Parameter(Mandatory)][string]$NameOrPath)
+    if (Test-Path -LiteralPath $NameOrPath) {
+        return Get-ProjectInfo -FolderPath ([System.IO.Path]::GetFullPath($NameOrPath))
+    }
+    foreach ($root in (Get-AllProjectRoots)) {
+        $candidate = Join-Path $root $NameOrPath
+        if (Test-Path -LiteralPath $candidate) { return Get-ProjectInfo -FolderPath $candidate }
+    }
+    throw "Project '$NameOrPath' not found (searched: $((Get-AllProjectRoots) -join '; '))."
+}
+
+function Out-CliJson {
+    param([Parameter(Mandatory)]$Object)
+    if ($script:Json) { Write-Output ($Object | ConvertTo-Json -Depth 6) }
+}
+
+function Install-ProjectHeadless {
+    # Non-prompting install core: sanitize a staged project and copy it into the root.
+    param(
+        [Parameter(Mandatory)][string]$StagedRoot,
+        [string]$NewName = '',
+        [string]$NewTitle = ''
+    )
+    $info = Get-ProjectInfo -FolderPath $StagedRoot
+    $finalName = if ($NewName -ne '') { $NewName } else { $info.Name }
+    if ($finalName -notmatch '^[A-Za-z][A-Za-z0-9_]*$') {
+        throw "Project name '$finalName' is invalid (must start with a letter; letters, digits, underscore only)."
+    }
+    $root = if ($script:ProjectsRoot -ne '') { $script:ProjectsRoot } else { Get-ProjectsRoot }
+    if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+    $dest = Join-Path $root $finalName
+    if (Test-Path -LiteralPath $dest) {
+        throw "A project folder named '$finalName' already exists in '$root'. Pass -Name to pick another, or remove it first."
+    }
+    $finalTitle = if ($NewTitle -ne '') { $NewTitle } elseif ($info.Title -ne '') { $info.Title } else { $finalName }
+
+    $installed = Get-InstalledUefnVersion
+    if ($installed -and (Test-VersionCompatible -Required $info.CompatibilityVersion -Installed $installed.Version) -eq $false) {
+        Write-Warn "Project requires UEFN $($info.CompatibilityVersion); detected $($installed.Version). It may fail to open until UEFN updates."
+    }
+
+    $newInfo = Invoke-ProjectSanitize -StagingPath $StagedRoot -NewTitle $finalTitle -Mode Install -NewProjectName $finalName
+    if ($finalName -ne $newInfo.Name) {
+        Rename-Item -LiteralPath $newInfo.UefnProjectFile -NewName "$finalName.uefnproject"
+    }
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    Get-ChildItem -LiteralPath $StagedRoot -Force | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $dest -Recurse -Force
+    }
+    Get-ChildItem -LiteralPath $dest -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Unblock-File -ErrorAction SilentlyContinue
+    Write-Ok "Installed '$finalTitle' to $dest"
+    return [pscustomobject]@{ name = $finalName; title = $finalTitle; path = $dest }
+}
+
+function Invoke-CliCommand {
+    param([Parameter(Mandatory)][string]$Cmd)
+    switch ($Cmd.ToLowerInvariant()) {
+
+        'list' {
+            $projects = @(Get-LocalProjects)
+            $out = @($projects | ForEach-Object {
+                [pscustomobject]@{
+                    name = $_.Info.Name; title = $_.Info.Title; path = $_.Info.FolderPath
+                    projectId = $_.Info.ProjectId; versePath = $_.Info.ProjectVersePath
+                    bound = $_.Info.IsBound; variantOf = $_.VariantOf
+                    compatibilityVersion = $_.Info.CompatibilityVersion
+                }
+            })
+            if ($script:Json) { Out-CliJson $out }
+            else { foreach ($p in $out) { Write-Output ("{0}`t{1}`t{2}" -f $p.name, $(if ($p.variantOf) { "variant of $($p.variantOf)" } else { 'root' }), $p.path) } }
+        }
+
+        'catalog' {
+            $url = if ($script:CatalogUrl -ne '') { $script:CatalogUrl } else { (Get-UefnKitSettings).catalogUrl }
+            $catalog = Get-Catalog -Url $url
+            if ($script:Json) { Out-CliJson $catalog }
+            else { foreach ($e in @($catalog.projects)) { Write-Output ("{0}`t{1}`tv{2}`t{3}" -f $e.id, $e.title, $e.version, $e.downloadUrl) } }
+        }
+
+        'install' {
+            $stagedRoot = $null
+            if ($script:Path -ne '') {
+                if (-not (Test-Path -LiteralPath $script:Path)) { throw "Path not found: $($script:Path)" }
+                $item = Get-Item -LiteralPath $script:Path
+                $staging = New-StagingDir
+                if ($item.PSIsContainer) {
+                    $srcRoot = Resolve-StagedProjectRoot -SearchDir $item.FullName
+                    $stagedRoot = Copy-ProjectToStaging -SourceDir $srcRoot -StagingDir $staging -ExcludeTopLevel @('.lore', '.urc')
+                } elseif ($item.Extension -ieq '.zip') {
+                    $stagedRoot = Expand-ProjectZip -ZipPath $item.FullName -StagingDir $staging
+                } else { throw '-Path must be a folder or a .zip file.' }
+                $result = Install-ProjectHeadless -StagedRoot $stagedRoot -NewName $script:Name -NewTitle $script:Title
+            } elseif ($script:Id -ne '') {
+                $url = if ($script:CatalogUrl -ne '') { $script:CatalogUrl } else { (Get-UefnKitSettings).catalogUrl }
+                $catalog = Get-Catalog -Url $url
+                $entry = @($catalog.projects) | Where-Object { "$($_.id)" -eq $script:Id } | Select-Object -First 1
+                if ($null -eq $entry) { throw "No catalog entry with id '$($script:Id)' at $url" }
+                $staging = New-StagingDir
+                $zipPath = Join-Path $staging 'pkg.zip'
+                Save-FileWithProgress -Url $entry.downloadUrl -OutFile $zipPath
+                if ($entry.PSObject.Properties['sha256'] -and $entry.sha256) {
+                    if (-not (Test-FileSha256 -Path $zipPath -Expected $entry.sha256)) { throw 'SHA-256 checksum mismatch - aborting.' }
+                }
+                $extract = New-StagingDir
+                $stagedRoot = Expand-ProjectZip -ZipPath $zipPath -StagingDir $extract
+                $entryTitle = if ($script:Title -ne '') { $script:Title } else { "$($entry.title)" }
+                $result = Install-ProjectHeadless -StagedRoot $stagedRoot -NewName $script:Name -NewTitle $entryTitle
+            } else {
+                throw "install needs -Path <zip-or-folder> or -Id <catalog-entry-id>."
+            }
+            Out-CliJson $result
+        }
+
+        'duplicate' {
+            if ($script:Project -eq '') { throw 'duplicate needs -Project <name-or-path>.' }
+            if ($script:Name -eq '') { throw 'duplicate needs -Name <new-project-name>.' }
+            $info = Resolve-CliProject -NameOrPath $script:Project
+            if ($script:ProjectsRoot -eq '') { $script:ProjectsRoot = Split-Path -Parent $info.FolderPath }
+            $staging = New-StagingDir
+            $stagedRoot = Copy-ProjectToStaging -SourceDir $info.FolderPath -StagingDir $staging -ExcludeTopLevel @('.lore', '.urc', '.git')
+            $newTitle = if ($script:Title -ne '') { $script:Title } else { "$($info.Title) Copy" }
+            $newInfo = Invoke-ProjectSanitize -StagingPath $stagedRoot -NewTitle $newTitle -Mode Duplicate -NewProjectName $script:Name
+            if ($script:Name -ne $newInfo.Name) {
+                Rename-Item -LiteralPath $newInfo.UefnProjectFile -NewName "$($script:Name).uefnproject"
+            }
+            $dest = Join-Path $script:ProjectsRoot $script:Name
+            if (Test-Path -LiteralPath $dest) { throw "A project folder named '$($script:Name)' already exists." }
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Get-ChildItem -LiteralPath $stagedRoot -Force | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $dest -Recurse -Force }
+            Write-Ok "Duplicated '$($info.Name)' as '$($script:Name)' at $dest"
+            Out-CliJson ([pscustomobject]@{ name = $script:Name; title = $newTitle; path = $dest; source = $info.Name })
+        }
+
+        'variants' {
+            if ($script:Project -eq '') { throw 'variants needs -Project <root-name-or-path>.' }
+            $info = Resolve-CliProject -NameOrPath $script:Project
+            if (-not (Test-Path -LiteralPath (Join-Path $info.FolderPath 'variants.json'))) {
+                throw "'$($info.Name)' has no variants.json. Create it (interactive mode can scaffold one) before generating."
+            }
+            $manifest = Get-VariantsManifest -RootInfo $info
+            $parentDir = Split-Path -Parent $info.FolderPath
+            $existing = @($manifest.Variants | Where-Object { Test-Path -LiteralPath (Join-Path $parentDir $_.Name) } | ForEach-Object { $_.Name })
+            if ($existing.Count -gt 0 -and -not $script:Yes) {
+                throw "These variant projects already exist and would be overwritten: $($existing -join ', '). Pass -Yes to confirm."
+            }
+            $done = Invoke-VariantGeneration -RootInfo $info -Manifest $manifest
+            Write-Ok "$done variant(s) generated/updated."
+            Out-CliJson ([pscustomobject]@{ root = $info.Name; generated = $done; variants = @($manifest.Variants | ForEach-Object { $_.Name }) })
+        }
+
+        'export' {
+            if ($script:Project -eq '') { throw 'export needs -Project <name-or-path>.' }
+            $info = Resolve-CliProject -NameOrPath $script:Project
+            $ver = if ($script:Version -ne '') { $script:Version } else { '1.0.0' }
+            $pkgTitle = if ($script:Title -ne '') { $script:Title } elseif ($info.Title -ne '') { $info.Title } else { $info.Name }
+            $pkgAuthor = $script:Author
+            if ($pkgAuthor -eq '' -and $info.ProjectVersePath -match '^/([^/@]+)@') { $pkgAuthor = $Matches[1] }
+            $pkgDesc = if ($script:Description -ne '') { $script:Description } else { $info.Description }
+            $outDir = if ($script:OutDir -ne '') { $script:OutDir }
+                      elseif ($PSScriptRoot) { Join-Path $PSScriptRoot 'dist' }
+                      else { [Environment]::GetFolderPath('Desktop') }
+
+            $staging = New-StagingDir
+            $stagedRoot = Copy-ProjectToStaging -SourceDir $info.FolderPath -StagingDir $staging -ExcludeTopLevel @('.lore', '.urc', '.git')
+            $post = Invoke-ProjectSanitize -StagingPath $stagedRoot -NewTitle $pkgTitle -Mode Export -NewDescription $pkgDesc
+            $zipPath = Join-Path $outDir ("{0}-{1}.zip" -f $post.Name, $ver)
+            New-ProjectZip -ProjectDir $stagedRoot -ZipPath $zipPath
+            $zipItem = Get-Item -LiteralPath $zipPath
+            $sha = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $entry = [pscustomobject]@{
+                id = ($post.Name.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+                name = $post.Name; title = $pkgTitle; description = $pkgDesc; author = $pkgAuthor
+                version = $ver; uefnCompatibilityVersion = $post.CompatibilityVersion
+                sizeMB = [math]::Round($zipItem.Length / 1MB, 1); sha256 = $sha
+                downloadUrl = "https://github.com/magnusenebakk-epic/UEFNKit/releases/download/<tag>/$($zipItem.Name)"
+            }
+            Write-Ok "Packaged: $zipPath"
+            $published = $false
+            if ($script:Publish) {
+                if (-not (Test-PublisherEnvironment)) {
+                    throw 'Cannot publish: run from the catalog repo with an authenticated gh CLI.'
+                }
+                if (-not (Invoke-CatalogPublish -Entry $entry -ZipPath $zipPath)) { throw 'Publish failed.' }
+                $published = $true
+            }
+            Out-CliJson ([pscustomobject]@{ zip = $zipPath; published = $published; entry = $entry })
+        }
+
+        'remove' {
+            if ($script:Project -eq '') { throw 'remove needs -Project <name-or-path>.' }
+            if (-not $script:Yes) { throw "remove permanently deletes the project and UEFN's sidecar state for it. Pass -Yes to confirm." }
+            $info = Resolve-CliProject -NameOrPath $script:Project
+            $sidecars = @(Get-ProjectSidecarPaths -Info $info)
+            Clear-ReadOnlyFlags -Path $info.FolderPath
+            Remove-Item -LiteralPath $info.FolderPath -Recurse -Force -ErrorAction Stop
+            Write-Ok "Deleted $($info.FolderPath)"
+            $cleaned = @()
+            foreach ($s in $sidecars) {
+                try { Remove-Item -LiteralPath $s -Recurse -Force -ErrorAction Stop; $cleaned += $s }
+                catch { Write-Warn "Could not remove $s" }
+            }
+            Out-CliJson ([pscustomobject]@{ removed = $info.FolderPath; sidecarsCleaned = $cleaned })
+        }
+
+        'catalog-remove' {
+            if ($script:Id -eq '') { throw 'catalog-remove needs -Id <entry-id>.' }
+            if (-not $script:Yes) { throw 'catalog-remove edits and pushes your catalog. Pass -Yes to confirm.' }
+            $mc = Get-ManagedCatalogInfo
+            if ($null -eq $mc) { throw 'Not the catalog owner here: run from the catalog repo with the matching catalog URL configured.' }
+            $catalog = Get-Content -LiteralPath $mc.IndexPath -Raw | ConvertFrom-Json
+            $entry = @($catalog.projects) | Where-Object { "$($_.id)" -eq $script:Id } | Select-Object -First 1
+            if ($null -eq $entry) { throw "No catalog entry with id '$($script:Id)'." }
+            if (-not (Invoke-CatalogEntryDelete -Repo $mc.Repo -EntryId $script:Id)) { throw 'Catalog entry deletion failed.' }
+            $releaseDeleted = $false
+            if ($script:DeleteRelease -and "$($entry.downloadUrl)" -match ('^https://github\.com/' + [regex]::Escape($mc.Slug) + '/releases/download/([^/]+)/')) {
+                $tag = $Matches[1]
+                & gh release delete $tag -R $mc.Slug --yes --cleanup-tag
+                if ($LASTEXITCODE -eq 0) { $releaseDeleted = $true; Write-Ok "Release '$tag' deleted." }
+                else { Write-Warn 'gh release delete failed (is gh signed in?).' }
+            }
+            Out-CliJson ([pscustomobject]@{ removedId = $script:Id; releaseDeleted = $releaseDeleted })
+        }
+
+        'version' {
+            if ($script:Json) { Out-CliJson ([pscustomobject]@{ version = $script:ToolVersion }) }
+            else { Write-Output $script:ToolVersion }
+        }
+
+        'help' { Show-CliHelp }
+
+        default {
+            Show-CliHelp
+            throw "Unknown command '$Cmd'."
+        }
+    }
+}
+
+function Show-CliHelp {
+    Write-Host @"
+UEFNKit v$script:ToolVersion - headless commands (see AGENTS.md for full details)
+
+  powershell -ExecutionPolicy Bypass -File UEFNKit.ps1 <command> [options]
+
+  list            [-Json]                              List local projects (name, root/variant, path)
+  catalog         [-CatalogUrl <url>] [-Json]          List catalog entries
+  install         -Path <zip|folder> | -Id <entryId>   Install a project (identity reset to unbound)
+                  [-Name <n>] [-Title <t>] [-ProjectsRoot <dir>] [-CatalogUrl <url>] [-Json]
+  duplicate       -Project <n|path> -Name <newName>    Copy a project as a fresh independent project
+                  [-Title <t>] [-Json]
+  variants        -Project <root> [-Yes] [-Json]       Generate variants from variants.json
+                                                       (-Yes required when variants already exist)
+  export          -Project <n|path> [-Version <v>]     Package a project for sharing
+                  [-Title <t>] [-Author <a>] [-Description <d>] [-OutDir <dir>] [-Publish] [-Json]
+  remove          -Project <n|path> -Yes [-Json]       Delete a project + UEFN sidecar state (no undo)
+  catalog-remove  -Id <entryId> -Yes [-DeleteRelease]  Delete a catalog entry (owner machine only)
+  version         [-Json]
+  help
+
+Exit code 0 = success, 1 = failure. With -Json the machine-readable result is the last
+JSON block on stdout. Destructive/overwriting commands refuse to run without -Yes.
+No command starts the interactive menu.
+"@
+}
+
+#endregion
+
+# Entry point: a command runs headless; otherwise the interactive menu starts.
+# Set UEFNKIT_NO_MAIN=1 to load the functions without running anything (tests).
+if ($Command -ne '') {
+    $script:NonInteractive = $true
+    $cliFailed = $false
+    try {
+        Invoke-CliCommand -Cmd $Command
+    } catch {
+        Write-Err $_.Exception.Message
+        $cliFailed = $true
+    } finally {
+        Remove-AllStagingDirs
+    }
+    exit $(if ($cliFailed) { 1 } else { 0 })
+}
 if (-not ($env:UEFNKIT_NO_MAIN -or $env:UEFNSHARE_NO_MAIN)) {
     Main
 }

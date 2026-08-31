@@ -114,6 +114,16 @@ Without `gh` (or when declined), Export falls back to manual mode:
 2. Upload the zip to a GitHub Release of this repo.
 3. Fix the `downloadUrl` in the entry, paste it into `index.json`'s `projects` array, commit and push.
 
+## Automation and AI agents
+
+Every feature is also available headless — no menus, no prompts:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File UEFNKit.ps1 <command> [options]
+```
+
+Commands: `list`, `catalog`, `install`, `duplicate`, `variants`, `export`, `remove`, `catalog-remove`, `version`, `help`. Add `-Json` for machine-readable results; destructive commands require `-Yes`; exit codes are 0/1. See **[AGENTS.md](AGENTS.md)** for the full contract — point your LLM/agent at that file.
+
 ## Requirements
 
 Windows with PowerShell 5.1+ (preinstalled on Windows 10/11). UEFN installed via the Epic Games Launcher. No other dependencies.
