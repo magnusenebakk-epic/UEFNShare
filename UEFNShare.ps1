@@ -4,7 +4,7 @@
 
 #region Constants
 
-$script:ToolVersion       = '1.3.1'
+$script:ToolVersion       = '1.4.0'
 $script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNShare/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNShare\settings.json'
 $script:UefnIniPath       = Join-Path $env:LOCALAPPDATA 'UnrealEditorFortnite\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini'
@@ -518,6 +518,66 @@ function Set-JsonGuidValue {
     return $rx.Replace($Text, $evaluator)
 }
 
+function Set-JsonRawValue {
+    # Replaces a non-string scalar (number or bool) under a uniquely-keyed field.
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$NewRaw
+    )
+    $pattern = '("' + [regex]::Escape($Key) + '"\s*:\s*)(-?\d+(?:\.\d+)?|true|false)'
+    $rx = New-Object regex($pattern)
+    $count = $rx.Matches($Text).Count
+    if ($count -ne 1) {
+        throw "Expected exactly 1 occurrence of JSON key '$Key' but found $count. Aborting to avoid corruption."
+    }
+    $evaluator = { param($m) $m.Groups[1].Value + $NewRaw }.GetNewClosure()
+    return $rx.Replace($Text, $evaluator)
+}
+
+function ConvertTo-PrettyJson {
+    # Minimal tab-indented JSON writer for tool-owned files (manifest, lock). Invariant
+    # culture for numbers; handles hashtables (ordered), PSCustomObjects, arrays, scalars.
+    param($Value, [int]$IndentLevel = 0)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $ind = "`t" * $IndentLevel
+    $indIn = "`t" * ($IndentLevel + 1)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { if ($Value) { return 'true' } else { return 'false' } }
+    if ($Value -is [string]) { return '"' + (ConvertTo-JsonStringLiteral $Value) + '"' }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or
+        $Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
+        return $Value.ToString($inv)
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        if ($Value.Keys.Count -eq 0) { return '{}' }
+        $parts = foreach ($k in $Value.Keys) {
+            $indIn + '"' + (ConvertTo-JsonStringLiteral ([string]$k)) + '": ' + (ConvertTo-PrettyJson $Value[$k] ($IndentLevel + 1))
+        }
+        return "{`r`n" + ($parts -join ",`r`n") + "`r`n$ind}"
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = @($Value)
+        if ($items.Count -eq 0) { return '[]' }
+        $parts = foreach ($item in $items) { $indIn + (ConvertTo-PrettyJson $item ($IndentLevel + 1)) }
+        return "[`r`n" + ($parts -join ",`r`n") + "`r`n$ind]"
+    }
+    if ($Value -is [psobject]) {
+        $props = @($Value.PSObject.Properties)
+        if ($props.Count -eq 0) { return '{}' }
+        $parts = foreach ($p in $props) {
+            $indIn + '"' + (ConvertTo-JsonStringLiteral $p.Name) + '": ' + (ConvertTo-PrettyJson $p.Value ($IndentLevel + 1))
+        }
+        return "{`r`n" + ($parts -join ",`r`n") + "`r`n$ind}"
+    }
+    return '"' + (ConvertTo-JsonStringLiteral ([string]$Value)) + '"'
+}
+
+function Write-JsonPretty {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Value)
+    Write-TextFileNoBom -Path $Path -Text ((ConvertTo-PrettyJson $Value) + "`r`n")
+}
+
 function New-ProjectGuid {
     # Fresh GUID; avoids the (cosmically unlikely) collision with an existing local UEFN sidecar.
     do {
@@ -532,14 +592,23 @@ function Update-UefnProjectFile {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$NewTitle,
         [string[]]$ModuleNames = @(),
-        $NewDescription = $null  # untyped: [string] would coerce $null to '' and blank descriptions
+        $NewDescription = $null,  # untyped: [string] would coerce $null to '' and blank descriptions
+        [string]$ProjectId = '',            # keep a specific id (variant regen); '' = fresh
+        [hashtable]$ModuleGuidMap = $null,  # module name -> guid to keep; missing names get fresh
+        [string]$ProjectVersePath = ''      # preserved binding for variant regen; '' = unbound
     )
     $text = Read-TextFileRaw $Path
-    $text = Set-JsonGuidValue -Text $text -Key 'projectId' -NewGuid (New-ProjectGuid)
+    $newId = if ($ProjectId -ne '') { $ProjectId } else { New-ProjectGuid }
+    $text = Set-JsonGuidValue -Text $text -Key 'projectId' -NewGuid $newId
     foreach ($m in $ModuleNames) {
-        $text = Set-JsonGuidValue -Text $text -Key $m -NewGuid ([guid]::NewGuid().ToString())
+        $g = if ($ModuleGuidMap -and $ModuleGuidMap.ContainsKey($m) -and "$($ModuleGuidMap[$m])" -ne '') {
+            "$($ModuleGuidMap[$m])"
+        } else {
+            [guid]::NewGuid().ToString()
+        }
+        $text = Set-JsonGuidValue -Text $text -Key $m -NewGuid $g
     }
-    $text = Set-JsonScalar -Text $text -Key 'projectVersePath' -NewValue ''
+    $text = Set-JsonScalar -Text $text -Key 'projectVersePath' -NewValue $ProjectVersePath
     $text = Set-JsonScalar -Text $text -Key 'title' -NewValue $NewTitle
     if ($null -ne $NewDescription) {
         $text = Set-JsonScalar -Text $text -Key 'description' -NewValue ([string]$NewDescription)
@@ -873,6 +942,326 @@ function Test-FileSha256 {
     )
     $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
     return ($actual -ieq $Expected)
+}
+
+#endregion
+
+#region Variants
+
+# dataSets.matchmaking keys the tool may patch, with their JSON kind. 'version' is
+# deliberately absent: the key name is not unique inside the .uefnproject.
+$script:MatchmakingKeys = @{
+    maxPlayers = 'num'; maxTeamCount = 'num'; maxTeamSize = 'num'; maxSocialPartySize = 'num'
+    minPlayers = 'num'; overtimePlayerTarget = 'num'; queueMainDuration = 'num'; queueOvertimeDuration = 'num'
+    allowJoinInProgress = 'bool'; allowSquadFillOption = 'bool'; useSkillBasedMatchmaking = 'bool'; splitscreenDisabled = 'bool'
+    islandQueuePrivacy = 'str'; ratingType = 'str'
+}
+
+function Get-VariantsManifest {
+    # Loads and validates <root>\variants.json. Returns @{ Defaults; Variants } where each
+    # variant is normalized to Suffix/Name/Title/Matchmaking/VerseConfig.
+    param([Parameter(Mandatory)]$RootInfo)
+    $path = Join-Path $RootInfo.FolderPath 'variants.json'
+    $json = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    $defaults = if ($json.PSObject.Properties['defaults']) { $json.defaults } else { $null }
+    if ($null -eq $json.PSObject.Properties['variants'] -or @($json.variants).Count -eq 0) {
+        throw "variants.json has no 'variants' array (or it is empty)."
+    }
+    $seen = @()
+    $variants = foreach ($v in @($json.variants)) {
+        $suffix = "$($v.suffix)"
+        if ($suffix -notmatch '^[A-Za-z0-9_]+$') { throw "Variant suffix '$suffix' is invalid (letters, digits, underscore only)." }
+        $name = if ($v.PSObject.Properties['name'] -and "$($v.name)" -ne '') { "$($v.name)" } else { "$($RootInfo.Name)$suffix" }
+        if ($name -notmatch '^[A-Za-z][A-Za-z0-9_]*$') { throw "Variant project name '$name' is invalid (must start with a letter; letters, digits, underscore only)." }
+        if ($name -eq $RootInfo.Name) { throw "Variant '$suffix' resolves to the root project's own name." }
+        if ($seen -contains $name) { throw "Two variants resolve to the same project name '$name'." }
+        $seen += $name
+        $mm = if ($v.PSObject.Properties['matchmaking']) { $v.matchmaking } else { $null }
+        if ($mm) {
+            foreach ($p in $mm.PSObject.Properties) {
+                if (-not $script:MatchmakingKeys.ContainsKey($p.Name)) {
+                    throw "Variant '$suffix': unknown matchmaking key '$($p.Name)'. Allowed: $(($script:MatchmakingKeys.Keys | Sort-Object) -join ', ')"
+                }
+            }
+        }
+        $vc = if ($v.PSObject.Properties['verseConfig']) { $v.verseConfig } else { $null }
+        if ($vc) {
+            foreach ($p in $vc.PSObject.Properties) {
+                if ($p.Name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Variant '$suffix': verseConfig key '$($p.Name)' is not a valid Verse identifier." }
+            }
+        }
+        [pscustomobject]@{
+            Suffix = $suffix; Name = $name
+            Title = if ($v.PSObject.Properties['title'] -and "$($v.title)" -ne '') { "$($v.title)" } else { $name }
+            Matchmaking = $mm; VerseConfig = $vc
+        }
+    }
+    return @{ Defaults = $defaults; Variants = @($variants) }
+}
+
+function Merge-VerseConfig {
+    # defaults first, per-variant overrides on top; order preserved for stable output.
+    param($Defaults, $Overrides)
+    $merged = [ordered]@{}
+    foreach ($src in @($Defaults, $Overrides)) {
+        if ($null -eq $src) { continue }
+        foreach ($p in $src.PSObject.Properties) { $merged[$p.Name] = $p.Value }
+    }
+    return $merged
+}
+
+function ConvertTo-VerseLiteral {
+    # Maps a JSON value to a Verse type + literal. Verse strings interpolate {}, so braces
+    # must be escaped alongside the usual characters.
+    param($Value)
+    if ($Value -is [bool]) {
+        return @{ Type = 'logic'; Literal = $(if ($Value) { 'true' } else { 'false' }) }
+    }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [int16]) {
+        return @{ Type = 'int'; Literal = $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+    }
+    if ($Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
+        $lit = $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        if ($lit -notmatch '[.eE]') { $lit += '.0' }
+        return @{ Type = 'float'; Literal = $lit }
+    }
+    $s = "$Value"
+    $escaped = $s.Replace('\', '\\').Replace('"', '\"').Replace('{', '\{').Replace('}', '\}')
+    return @{ Type = 'string'; Literal = '"' + $escaped + '"' }
+}
+
+function Write-VariantConfigVerse {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Values
+    )
+    if ($Values.Keys.Count -eq 0) { return }
+    $lines = @(
+        '# Generated by UEFNShare from variants.json. Do not edit by hand -'
+        "# rerun 'Generate variants' on the root project instead."
+        'VariantConfig<public> := module:'
+    )
+    foreach ($k in $Values.Keys) {
+        $lit = ConvertTo-VerseLiteral $Values[$k]
+        $lines += "    $k<public>:$($lit.Type) = $($lit.Literal)"
+    }
+    Write-TextFileNoBom -Path $Path -Text (($lines -join "`r`n") + "`r`n")
+}
+
+function Update-MatchmakingSettings {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Settings
+    )
+    $text = Read-TextFileRaw $Path
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    foreach ($p in $Settings.PSObject.Properties) {
+        switch ($script:MatchmakingKeys[$p.Name]) {
+            'str' { $text = Set-JsonScalar -Text $text -Key $p.Name -NewValue "$($p.Value)" }
+            'bool' { $text = Set-JsonRawValue -Text $text -Key $p.Name -NewRaw $(if ($p.Value) { 'true' } else { 'false' }) }
+            default { $text = Set-JsonRawValue -Text $text -Key $p.Name -NewRaw ([double]$p.Value).ToString($inv) }
+        }
+    }
+    Write-TextFileNoBom -Path $Path -Text $text
+}
+
+function Invoke-VariantGeneration {
+    # Generates/updates each manifest variant next to the root. Overwrites preserve the
+    # variant's identity (projectId, module GUIDs, Verse binding, .lore history) so an
+    # already-published variant keeps its link to the published island across updates.
+    param([Parameter(Mandatory)]$RootInfo, [Parameter(Mandatory)]$Manifest)
+    $parentDir = Split-Path -Parent $RootInfo.FolderPath
+    $lockPath = Join-Path $RootInfo.FolderPath 'variants.lock.json'
+    $lock = $null
+    if (Test-Path -LiteralPath $lockPath) {
+        try { $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json } catch { }
+    }
+    $lockOut = [ordered]@{}
+    $done = 0
+
+    # Root gets the pure-defaults config so it stays compilable and playable.
+    if ($Manifest.Defaults -and @($Manifest.Defaults.PSObject.Properties).Count -gt 0) {
+        Write-VariantConfigVerse -Path (Join-Path $RootInfo.FolderPath 'Content\VariantConfig.verse') `
+            -Values (Merge-VerseConfig $Manifest.Defaults $null)
+        Write-Info 'Root Content\VariantConfig.verse refreshed from defaults.'
+    }
+
+    foreach ($v in $Manifest.Variants) {
+        try {
+            $dest = Join-Path $parentDir $v.Name
+            $existing = $null
+            if (Test-Path -LiteralPath $dest) {
+                $pf = @(Get-ChildItem -LiteralPath $dest -Filter '*.uefnproject' -File -ErrorAction SilentlyContinue)
+                if ($pf.Count -eq 0) {
+                    Write-Err "Skipping '$($v.Name)': a folder with that name exists but is not a UEFN project - not touching it."
+                    continue
+                }
+                $existing = Get-ProjectInfo -FolderPath $dest
+                Write-Warn "Variant project '$($v.Name)' already exists."
+                Write-Info 'Overwriting replaces its content with the root''s (manual content changes in the variant are lost).'
+                Write-Info 'Its identity - projectId, Verse binding, revision-control history - is preserved.'
+                if (-not (Read-YesNo "Overwrite '$($v.Name)'?" -Default $true)) {
+                    Write-Info "Skipped '$($v.Name)'."
+                    if ($existing) { $lockOut[$v.Suffix] = [ordered]@{ name = $v.Name; projectId = $existing.ProjectId; modules = $existing.Modules } }
+                    continue
+                }
+            }
+
+            # Identity: existing project on disk wins; else the lock (recreates a deleted
+            # variant with its published identity); else fresh.
+            $keepId = ''; $keepModules = $null; $keepVersePath = ''
+            if ($existing) {
+                $keepId = $existing.ProjectId
+                $keepModules = $existing.Modules
+                $keepVersePath = $existing.ProjectVersePath
+            } elseif ($lock -and $lock.PSObject.Properties['variants'] -and $lock.variants.PSObject.Properties[$v.Suffix]) {
+                $le = $lock.variants.($v.Suffix)
+                $keepId = "$($le.projectId)"
+                $keepModules = @{}
+                foreach ($p in $le.modules.PSObject.Properties) { $keepModules[$p.Name] = "$($p.Value)" }
+                Write-Info "Recreating '$($v.Name)' with its previous identity from variants.lock.json."
+            }
+            $variantVersePath = if ($keepVersePath -ne '') { $keepVersePath } else { "$script:VerseSentinelRoot/$($v.Name)" }
+
+            # Stage a copy of the root (manifest/lock and RC/history never propagate).
+            $staging = New-StagingDir
+            $stagedRoot = Copy-ProjectToStaging -SourceDir $RootInfo.FolderPath -StagingDir $staging `
+                -ExcludeTopLevel @('.lore', '.urc', '.git', 'variants.json', 'variants.lock.json')
+            Get-ChildItem -LiteralPath $stagedRoot -Filter '*.code-workspace' -File -ErrorAction SilentlyContinue |
+                Remove-Item -Force
+
+            $upf = Join-Path $stagedRoot "$($RootInfo.Name).uefnproject"
+            Update-UefnProjectFile -Path $upf -NewTitle $v.Title -ModuleNames @($RootInfo.Modules.Keys) `
+                -ProjectId $keepId -ModuleGuidMap $keepModules -ProjectVersePath $keepVersePath
+            if ($v.Matchmaking) { Update-MatchmakingSettings -Path $upf -Settings $v.Matchmaking }
+            Rename-Item -LiteralPath $upf -NewName "$($v.Name).uefnproject"
+
+            Update-UpluginFile -Path (Join-Path $stagedRoot "$($RootInfo.PluginName).uplugin") -NewVersePath $variantVersePath
+
+            $oldPaths = @("$script:VerseSentinelRoot/$($RootInfo.Name)")
+            if ($RootInfo.ProjectVersePath -ne '') { $oldPaths = @($RootInfo.ProjectVersePath) + $oldPaths }
+            $null = Update-VerseSources -ContentDir (Join-Path $stagedRoot 'Content') `
+                -OldVersePaths $oldPaths -OldProjectNames @($RootInfo.Name) -NewVersePath $variantVersePath
+
+            $cfg = Merge-VerseConfig $Manifest.Defaults $v.VerseConfig
+            if ($cfg.Keys.Count -gt 0) {
+                Write-VariantConfigVerse -Path (Join-Path $stagedRoot 'Content\VariantConfig.verse') -Values $cfg
+            }
+
+            # Swap into place: everything is replaced EXCEPT the variant's own RC history.
+            if ($existing) {
+                Clear-ReadOnlyFlags -Path $dest
+                Get-ChildItem -LiteralPath $dest -Force |
+                    Where-Object { $_.Name -notin @('.lore', '.urc', '.git') } |
+                    Remove-Item -Recurse -Force -ErrorAction Stop
+            } else {
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            }
+            Get-ChildItem -LiteralPath $stagedRoot -Force | ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination $dest -Recurse -Force
+            }
+            Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+
+            $newInfo = Get-ProjectInfo -FolderPath $dest
+            $lockOut[$v.Suffix] = [ordered]@{ name = $v.Name; projectId = $newInfo.ProjectId; modules = $newInfo.Modules }
+            $bindNote = if ($keepVersePath -ne '') { 'kept binding ' + $keepVersePath } elseif ($keepId -ne '') { 'kept identity' } else { 'new identity' }
+            Write-Ok ("Variant '{0}' {1} ({2})" -f $v.Name, $(if ($existing) { 'updated' } else { 'created' }), $bindNote)
+            $done++
+        } catch {
+            Write-Err "Variant '$($v.Name)' failed: $($_.Exception.Message)"
+        }
+    }
+    Write-JsonPretty -Path $lockPath -Value ([ordered]@{ variants = $lockOut })
+    return $done
+}
+
+function Read-IntPrompt {
+    param([Parameter(Mandatory)][string]$Message, [int]$Default)
+    while ($true) {
+        $s = Read-Prompt $Message -Default "$Default"
+        $n = 0
+        if ([int]::TryParse($s, [ref]$n)) { return $n }
+        Write-Warn 'Enter a whole number.'
+    }
+}
+
+function New-VariantsManifestInteractive {
+    # Prompt-driven creation of variants.json so nobody has to hand-write JSON.
+    param([Parameter(Mandatory)]$RootInfo)
+    $variants = @()
+    while ($true) {
+        Write-Head ("Variant {0}" -f ($variants.Count + 1))
+        $suffix = ''
+        while ($true) {
+            $suffix = Read-Prompt ("Variant suffix (e.g. 4v4 - project will be named $($RootInfo.Name)<suffix>)")
+            if ($suffix -match '^[A-Za-z0-9_]+$') { break }
+            Write-Warn 'Letters, digits and underscores only.'
+        }
+        $title = Read-Prompt 'Variant title' -Default "$($RootInfo.Title) $suffix"
+        $sizeDefault = 4; $playersDefault = 8
+        if ($suffix -match '^(\d+)[vV](\d+)$') {
+            $sizeDefault = [Math]::Max([int]$Matches[1], [int]$Matches[2])
+            $playersDefault = [int]$Matches[1] + [int]$Matches[2]
+        }
+        $teamSize = Read-IntPrompt 'Max team size' $sizeDefault
+        $teamCount = Read-IntPrompt 'Team count' 2
+        $maxPlayers = Read-IntPrompt 'Max players' $playersDefault
+        $vc = [ordered]@{}
+        Write-Info 'Verse config values become constants in the generated VariantConfig module.'
+        while ($true) {
+            $pair = Read-Prompt 'Verse config Name=Value (Enter to finish)' -AllowEmpty
+            if ($pair -eq '') { break }
+            $eq = $pair.IndexOf('=')
+            if ($eq -lt 1) { Write-Warn 'Use Name=Value.'; continue }
+            $k = $pair.Substring(0, $eq).Trim()
+            $raw = $pair.Substring($eq + 1).Trim()
+            if ($k -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { Write-Warn 'Name must be a valid Verse identifier.'; continue }
+            $iv = 0; $dv = [double]0
+            if ($raw -match '^(true|false)$') { $vc[$k] = ($raw -ieq 'true') }
+            elseif ([int]::TryParse($raw, [ref]$iv)) { $vc[$k] = $iv }
+            elseif ([double]::TryParse($raw, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$dv)) { $vc[$k] = $dv }
+            else { $vc[$k] = $raw }
+        }
+        $variants += [ordered]@{
+            suffix = $suffix
+            title = $title
+            matchmaking = [ordered]@{ maxTeamSize = $teamSize; maxTeamCount = $teamCount; maxPlayers = $maxPlayers }
+            verseConfig = $vc
+        }
+        if (-not (Read-YesNo 'Add another variant?' -Default $false)) { break }
+    }
+    $manifest = [ordered]@{ defaults = [ordered]@{}; variants = $variants }
+    Write-JsonPretty -Path (Join-Path $RootInfo.FolderPath 'variants.json') -Value $manifest
+    Write-Ok "Wrote variants.json with $($variants.Count) variant(s). Edit it by hand anytime; 'defaults' holds shared Verse config values."
+}
+
+function Invoke-VariantsFlow {
+    $sel = Select-LocalProject -Title 'Generate variants of a project (pick the ROOT)'
+    if ($null -eq $sel) { return }
+    $info = $sel.Info
+
+    if (-not (Test-Path -LiteralPath (Join-Path $info.FolderPath 'variants.json'))) {
+        Write-Info "'$($info.Name)' has no variants.json yet."
+        if (-not (Read-YesNo 'Create one now?' -Default $true)) { return }
+        New-VariantsManifestInteractive -RootInfo $info
+    }
+    $manifest = Get-VariantsManifest -RootInfo $info
+
+    Write-Head "Variants of '$($info.Name)'"
+    foreach ($v in $manifest.Variants) {
+        $state = if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $info.FolderPath) $v.Name)) { 'update existing' } else { 'create new' }
+        Write-Info ("  {0}  (title: '{1}', {2})" -f $v.Name, $v.Title, $state)
+    }
+    if (Test-UefnRunning) {
+        Write-Warn 'UEFN is running. Close it first - overwriting a project that is open in the editor will fail or leave it in a mixed state.'
+        if (-not (Read-YesNo 'Continue anyway?' -Default $false)) { return }
+    }
+    if (-not (Read-YesNo ("Generate {0} variant(s) next to the root?" -f @($manifest.Variants).Count) -Default $true)) { return }
+
+    $done = Invoke-VariantGeneration -RootInfo $info -Manifest $manifest
+    Write-Host ''
+    Write-Ok "$done variant(s) generated/updated."
+    Write-Info 'Open each variant in UEFN to verify, then publish updates per variant as usual.'
 }
 
 #endregion
@@ -1520,6 +1909,13 @@ project to YOUR account and it behaves as if you created it.
                      is never modified.
   Duplicate          Copies one of your own projects as a fresh, independent
                      project (new GUIDs, unbound - UEFN re-binds it on open).
+  Variants           Generates team-size (or any) variations of a root project
+                     from a variants.json manifest: per-variant island matchmaking
+                     settings, a generated VariantConfig Verse module of constants,
+                     fresh identity on first creation. Re-running syncs the root's
+                     content into existing variants after a confirmation - their
+                     projectId, Verse binding and revision-control history are
+                     preserved so published islands keep their update link.
   Export             Packages one of your projects into a shareable zip with all
                      of your identity stripped, and emits a catalog entry.
   Remove             Deletes an installed project AND the editor-generated state
@@ -1561,6 +1957,7 @@ function Main {
             'Browse catalog and install',
             'Install from local zip or folder',
             'Duplicate one of my projects',
+            'Generate variants of a project (4v4/3v3/...)',
             'Export one of my projects for sharing',
             'Remove an installed project',
             'Settings',
@@ -1572,10 +1969,11 @@ function Main {
                 0  { Invoke-BrowseCatalogFlow }
                 1  { Invoke-LocalInstallFlow }
                 2  { Invoke-DuplicateFlow }
-                3  { Invoke-ExportFlow }
-                4  { Invoke-RemoveFlow }
-                5  { Invoke-SettingsFlow }
-                6  { Show-Help }
+                3  { Invoke-VariantsFlow }
+                4  { Invoke-ExportFlow }
+                5  { Invoke-RemoveFlow }
+                6  { Invoke-SettingsFlow }
+                7  { Show-Help }
             }
         } catch {
             Write-Err $_.Exception.Message
