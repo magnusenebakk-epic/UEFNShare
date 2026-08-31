@@ -4,7 +4,7 @@
 
 #region Constants
 
-$script:ToolVersion       = '2.1.0'
+$script:ToolVersion       = '2.2.0'
 $script:DefaultCatalogUrl = 'https://raw.githubusercontent.com/magnusenebakk-epic/UEFNKit/main/index.json'
 $script:SettingsPath      = Join-Path $env:APPDATA 'UEFNKit\settings.json'
 # Pre-rename locations (the tool used to be called UEFNShare); read as fallback.
@@ -1593,6 +1593,37 @@ function Test-PublisherEnvironment {
     return ($LASTEXITCODE -eq 0)
 }
 
+function Get-RepoSlug {
+    # owner/name from the repo's origin remote; $null when there is no usable remote.
+    param([Parameter(Mandatory)][string]$Repo)
+    $remote = (& git -C $Repo remote get-url origin 2>$null | Select-Object -First 1)
+    if (-not $remote) { return $null }
+    $slug = $remote.Trim() -replace '^https://github\.com/', '' -replace '^git@github\.com:', '' -replace '\.git$', ''
+    if ($slug -match '^[^/]+/[^/]+$') { return $slug }
+    return $null
+}
+
+function Get-ManagedCatalogInfo {
+    # Catalog management is offered ONLY when the tool can prove the configured catalog is
+    # the one in the repo it runs from: the catalog URL's GitHub slug equals the local
+    # repo's origin slug, or the URL is a direct path to this repo's index.json.
+    $repo = Get-PublisherRepoRoot
+    if ($null -eq $repo) { return $null }
+    $slug = Get-RepoSlug -Repo $repo
+    if ($null -eq $slug) { return $null }
+    $indexPath = Join-Path $repo 'index.json'
+    $url = (Get-UefnKitSettings).catalogUrl
+    $owned = $false
+    if ($url -match '^https://raw\.githubusercontent\.com/([^/]+/[^/]+)/(?:refs/heads/)?[^/]+/index\.json$') {
+        $owned = ($Matches[1] -ieq $slug)
+    } elseif ($url -match '^[A-Za-z]:' -or $url -match '^file://') {
+        $p = if ($url -match '^file://') { ([uri]$url).LocalPath } else { $url }
+        try { $owned = ([System.IO.Path]::GetFullPath($p) -ieq [System.IO.Path]::GetFullPath($indexPath)) } catch { }
+    }
+    if (-not $owned) { return $null }
+    return @{ Repo = $repo; Slug = $slug; IndexPath = $indexPath }
+}
+
 function Write-CatalogJson {
     # Serializes the catalog in the same tab-indented, human-editable style as the repo's
     # index.json. ConvertTo-Json is avoided: it reformats, \uXXXX-escapes, and writes
@@ -1651,9 +1682,8 @@ function Invoke-CatalogPublish {
     )
     $repo = Get-PublisherRepoRoot
     try {
-        $remote = (& git -C $repo remote get-url origin 2>$null | Select-Object -First 1)
-        if (-not $remote) { Write-Err 'No git remote named origin in the catalog repo.'; return $false }
-        $slug = $remote.Trim() -replace '^https://github\.com/', '' -replace '^git@github\.com:', '' -replace '\.git$', ''
+        $slug = Get-RepoSlug -Repo $repo
+        if (-not $slug) { Write-Err 'No usable git remote named origin in the catalog repo.'; return $false }
         $tag = "$($Entry.id)-$($Entry.version)"
 
         & gh release view $tag -R $slug *> $null
@@ -1911,6 +1941,90 @@ function Invoke-RemoveFlow {
     Write-Info 'UEFN forgets the project on its next Project Browser refresh; no other registration exists.'
 }
 
+function Invoke-CatalogEntryDelete {
+    # Removes one entry from the repo's index.json, commits and pushes.
+    param(
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$EntryId
+    )
+    try {
+        & git -C $Repo pull --rebase --autostash --quiet origin main
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn 'Could not sync with the remote first - continuing with the local index.json.'
+        }
+        $indexPath = Join-Path $Repo 'index.json'
+        $catalog = Get-Content -LiteralPath $indexPath -Raw | ConvertFrom-Json
+        $kept = @(@($catalog.projects) | Where-Object { "$($_.id)" -ne $EntryId })
+        if (@($catalog.projects).Count -eq $kept.Count) {
+            Write-Warn "No entry with id '$EntryId' found (already removed?)."
+            return $false
+        }
+        $removed = @($catalog.projects) | Where-Object { "$($_.id)" -eq $EntryId } | Select-Object -First 1
+        Write-CatalogJson -Path $indexPath -Name "$($catalog.name)" -Description "$($catalog.description)" -Projects $kept
+        & git -C $Repo add index.json
+        & git -C $Repo commit --quiet -m "Remove $($removed.name) from catalog"
+        if ($LASTEXITCODE -ne 0) { Write-Err 'git commit failed.'; return $false }
+        & git -C $Repo push --quiet origin main
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err 'git push failed. The change is committed locally - push it manually.'
+            return $false
+        }
+        Write-Ok "Removed '$($removed.title)' from the catalog and pushed."
+        return $true
+    } catch {
+        Write-Err "Delete failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Invoke-CatalogManageFlow {
+    while ($true) {
+        $mc = Get-ManagedCatalogInfo
+        if ($null -eq $mc) {
+            Write-Warn 'Catalog management is unavailable: the configured catalog URL is not the catalog in this repo.'
+            return
+        }
+        $catalog = $null
+        try { $catalog = Get-Content -LiteralPath $mc.IndexPath -Raw | ConvertFrom-Json } catch {
+            Write-Err "Could not read $($mc.IndexPath): $($_.Exception.Message)"
+            return
+        }
+        $entries = @($catalog.projects)
+        Write-Head "Manage catalog ($($mc.Slug)) - delete an entry"
+        if ($entries.Count -eq 0) {
+            Write-Info 'The catalog has no entries.'
+            return
+        }
+        $labels = foreach ($e in $entries) { "{0}  (id: {1}, v{2})" -f $e.title, $e.id, $e.version }
+        $pick = Read-MenuChoice -Options @($labels)
+        if ($pick -lt 0) { return }
+        $entry = $entries[$pick]
+        if (-not (Read-YesNo "Delete '$($entry.title)' (id: $($entry.id)) from the catalog?" -Default $false)) { continue }
+        if (-not (Invoke-CatalogEntryDelete -Repo $mc.Repo -EntryId "$($entry.id)")) { continue }
+
+        # Optional: also drop the release the entry pointed at (only on OUR repo).
+        $tag = $null
+        if ("$($entry.downloadUrl)" -match ('^https://github\.com/' + [regex]::Escape($mc.Slug) + '/releases/download/([^/]+)/')) {
+            $tag = $Matches[1]
+        }
+        if ($tag) {
+            $ghReady = $false
+            if (Get-Command gh -ErrorAction SilentlyContinue) {
+                & gh auth status *> $null
+                $ghReady = ($LASTEXITCODE -eq 0)
+            }
+            if ($ghReady) {
+                if (Read-YesNo "Also delete the GitHub release '$tag' and its zip? (existing download links stop working)" -Default $false) {
+                    & gh release delete $tag -R $mc.Slug --yes --cleanup-tag
+                    if ($LASTEXITCODE -eq 0) { Write-Ok "Release '$tag' deleted." } else { Write-Err 'gh release delete failed.' }
+                }
+            } else {
+                Write-Info "The release '$tag' still exists on GitHub; delete it there if you want the zip gone (gh is not signed in here)."
+            }
+        }
+    }
+}
+
 function Invoke-SettingsFlow {
     while ($true) {
         $settings = Get-UefnKitSettings
@@ -1972,6 +2086,10 @@ project to YOUR account and it behaves as if you created it.
                      preserved so published islands keep their update link.
   Export             Packages one of your projects into a shareable zip with all
                      of your identity stripped, and emits a catalog entry.
+  Manage my catalog  Only appears for catalog owners (the configured catalog URL
+                     matches the repo this tool runs from). Deletes catalog
+                     entries - commits and pushes index.json - and optionally
+                     deletes the entry's GitHub release via gh.
   Remove             Deletes an installed project AND the editor-generated state
                      UEFN keeps for it outside the project folder (per-project
                      config, Verse workspace/snapshot, autosaves). Asks you to
@@ -2007,28 +2125,26 @@ function Show-Banner {
 function Main {
     Show-Banner
     while ($true) {
-        $pick = Read-MenuChoice -Title 'Main menu' -Options @(
-            'Browse catalog and install',
-            'Install from local zip or folder',
-            'Duplicate one of my projects',
-            'Generate variants of a project',
-            'Export one of my projects for sharing',
-            'Remove an installed project',
-            'Settings',
-            'Help'
-        ) -BackLabel 'Quit' -DefaultChoice '1'
+        $items = @(
+            @{ Label = 'Browse catalog and install';            Action = { Invoke-BrowseCatalogFlow } },
+            @{ Label = 'Install from local zip or folder';      Action = { Invoke-LocalInstallFlow } },
+            @{ Label = 'Duplicate one of my projects';          Action = { Invoke-DuplicateFlow } },
+            @{ Label = 'Generate variants of a project';        Action = { Invoke-VariantsFlow } },
+            @{ Label = 'Export one of my projects for sharing'; Action = { Invoke-ExportFlow } },
+            @{ Label = 'Remove an installed project';           Action = { Invoke-RemoveFlow } }
+        )
+        # Owner-only: shown when the configured catalog is provably the one in this repo.
+        if (Get-ManagedCatalogInfo) {
+            $items += @{ Label = 'Manage my catalog'; Action = { Invoke-CatalogManageFlow } }
+        }
+        $items += @{ Label = 'Settings'; Action = { Invoke-SettingsFlow } }
+        $items += @{ Label = 'Help'; Action = { Show-Help } }
+
+        $pick = Read-MenuChoice -Title 'Main menu' -Options @($items | ForEach-Object { $_.Label }) `
+            -BackLabel 'Quit' -DefaultChoice '1'
         try {
-            switch ($pick) {
-                -1 { Remove-AllStagingDirs; return }
-                0  { Invoke-BrowseCatalogFlow }
-                1  { Invoke-LocalInstallFlow }
-                2  { Invoke-DuplicateFlow }
-                3  { Invoke-VariantsFlow }
-                4  { Invoke-ExportFlow }
-                5  { Invoke-RemoveFlow }
-                6  { Invoke-SettingsFlow }
-                7  { Show-Help }
-            }
+            if ($pick -lt 0) { Remove-AllStagingDirs; return }
+            & $items[$pick].Action
         } catch {
             Write-Err $_.Exception.Message
         } finally {
